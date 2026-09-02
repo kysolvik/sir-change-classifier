@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Land Cover Classifier</title>
+  <link
+    rel="stylesheet"
+    href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="app">
+    <aside id="panel">
+      <header class="panel-head">
+        <h1>Land Cover Classifier</h1>
+        <p class="sub">Teach the computer to map land cover from satellite embeddings.</p>
+      </header>
+
+      <!-- 1. Study area -->
+      <section class="card">
+        <h2><span class="step">1</span> Pick a study area</h2>
+        <label class="field">
+          <span>Example places</span>
+          <select id="preset"><option value="">Choose an example…</option></select>
+        </label>
+        <div class="latlon">
+          <label class="field"><span>Latitude</span>
+            <input id="lat" type="number" step="0.0001" placeholder="37.7749" /></label>
+          <label class="field"><span>Longitude</span>
+            <input id="lon" type="number" step="0.0001" placeholder="-122.4194" /></label>
+        </div>
+        <button id="go" class="btn">Go to area</button>
+        <p class="hint" id="area-hint">A <b id="box-km">10</b>&nbsp;km box will be placed around your point.</p>
+      </section>
+
+      <!-- 2. Classes -->
+      <section class="card">
+        <h2><span class="step">2</span> Define classes</h2>
+        <ul id="class-list" class="class-list"></ul>
+        <div class="add-class">
+          <input id="new-class" type="text" placeholder="e.g. water" maxlength="24" />
+          <input id="new-color" type="color" value="#1f78b4" title="class colour" />
+          <button id="add-class" class="btn small">Add</button>
+        </div>
+      </section>
+
+      <!-- 3. Points -->
+      <section class="card">
+        <h2><span class="step">3</span> Add training points</h2>
+        <p class="hint">Select a class above, then click the map to drop points on that
+          cover type. Aim for ~5 per class. Click a point to remove it.</p>
+        <div class="row">
+          <button id="undo" class="btn small ghost">Undo last</button>
+          <button id="clear-points" class="btn small ghost">Clear points</button>
+        </div>
+      </section>
+
+      <!-- 4. Classify -->
+      <section class="card">
+        <h2><span class="step">4</span> Classify</h2>
+        <label class="field"><span>Method</span>
+          <select id="classifier">
+            <option value="rf">Random forest</option>
+            <option value="knn">K-nearest neighbours</option>
+          </select>
+        </label>
+        <button id="classify" class="btn primary">Train &amp; classify</button>
+        <div class="year-block">
+          <div class="year-head">
+            <span>Year: <b id="year-label">2025</b></span>
+            <span id="trained-note" class="trained-note"></span>
+          </div>
+          <input id="year" type="range" min="2017" max="2025" step="1" value="2025" />
+        </div>
+        <label class="field opacity">
+          <span>Overlay opacity</span>
+          <input id="opacity" type="range" min="0" max="100" step="5" value="70" />
+        </label>
+      </section>
+
+      <!-- Results -->
+      <section class="card" id="results" hidden>
+        <h2>Results</h2>
+        <div id="stats" class="stats"></div>
+        <ul id="legend" class="legend"></ul>
+      </section>
+
+      <section class="card project">
+        <div class="row">
+          <button id="export" class="btn small ghost">Export project</button>
+          <button id="import-btn" class="btn small ghost">Import project</button>
+          <input id="import" type="file" accept="application/json" hidden />
+        </div>
+      </section>
+
+      <footer class="panel-foot">
+        <p>Embeddings: AlphaEarth Foundations (Google/DeepMind), CC-BY 4.0, via Source Cooperative.</p>
+      </footer>
+    </aside>
+
+    <main id="map-wrap">
+      <div id="map"></div>
+      <div id="status" class="status" hidden></div>
+    </main>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
