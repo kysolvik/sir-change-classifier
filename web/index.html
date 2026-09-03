@@ -91,6 +91,22 @@
         <p class="hint" id="classify-hint">Train a model (step 4) first, then slide to map any year.</p>
       </section>
 
+      <!-- 6. Compare two years -->
+      <section class="card">
+        <h2><span class="step">6</span> Compare two years</h2>
+        <p class="hint">Apply your trained model to two years and colour every place the
+          class changed.</p>
+        <div class="latlon">
+          <label class="field"><span>Year A</span>
+            <select id="compare-a"></select></label>
+          <label class="field"><span>Year B</span>
+            <select id="compare-b"></select></label>
+        </div>
+        <button id="compare" class="btn primary">Compare</button>
+        <p class="hint" id="compare-note" hidden></p>
+        <ul id="transitions" class="legend"></ul>
+      </section>
+
       <!-- Results -->
       <section class="card" id="results" hidden>
         <h2>Results</h2>

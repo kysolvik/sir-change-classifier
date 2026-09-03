@@ -72,3 +72,36 @@ def test_predict_can_apply_to_other_window(window, points):
     # signatures flipped -> left now looks like B, right like A
     assert res.labels[20, 5] == 1
     assert res.labels[20, 30] == 0
+
+
+def test_train_model_and_predict_window_match_wrapper(window, points):
+    trained = classify.train_model(window, points, ["A", "B"], "rf")
+    assert trained.n_classes == 2
+    assert trained.n_points_used == 10
+    assert trained.classifier == "rf"
+
+    labels = classify.predict_window(trained, window)
+    assert labels[20, 5] == 0 and labels[20, 30] == 1
+    assert labels[0, 0] == -1  # nodata corner stays masked
+
+    # The split must reproduce the one-shot wrapper exactly.
+    res = classify.train_and_predict(window, window, points, ["A", "B"], "rf")
+    assert np.array_equal(labels, res.labels)
+
+
+def test_transition_map_ids_and_observed():
+    k = 3
+    a = np.array([[0, 1, 2], [0, -1, 2]], dtype=np.int16)
+    b = np.array([[0, 2, 0], [1, 0, 2]], dtype=np.int16)
+    ids, observed, n_comparable = classify.transition_map(a, b, k)
+
+    assert ids[0, 0] == -1          # 0 -> 0 unchanged
+    assert ids[1, 2] == -1          # 2 -> 2 unchanged
+    assert ids[1, 1] == -1          # nodata in A
+    assert ids[0, 1] == 1 * k + 2   # 1 -> 2
+    assert ids[0, 2] == 2 * k + 0   # 2 -> 0
+    assert ids[1, 0] == 0 * k + 1   # 0 -> 1
+
+    assert {(f, t) for f, t, _ in observed} == {(1, 2), (2, 0), (0, 1)}
+    assert all(px == 1 for _, _, px in observed)
+    assert n_comparable == 5        # 6 pixels, 1 nodata in A (changed + unchanged)

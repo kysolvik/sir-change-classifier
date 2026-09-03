@@ -17,6 +17,8 @@ const state = {
   points: [],            // [{lat, lon, cls}]
   trainingYear: 2025,    // year the points are labelled/trained on
   targetYear: 2025,      // year being classified/displayed
+  compareA: 2017,        // Compare card: first year
+  compareB: 2025,        // Compare card: second year
   trainedYear: null,
   classifier: "rf",
   opacity: 0.7,
@@ -41,6 +43,7 @@ async function init() {
   renderPoints();
   if (state.center) goToArea(state.center.lat, state.center.lon, false);
   syncTrainUI();
+  syncCompareUI();
   syncYearUI();
 }
 
@@ -105,6 +108,19 @@ async function loadConfig() {
     trainYr.appendChild(opt);
   }
   trainYr.value = String(c.default_year);
+  // Compare card: two year dropdowns spanning the full range (earliest → latest).
+  state.compareA = c.min_year;
+  state.compareB = c.max_year;
+  for (const [id, val] of [["compare-a", c.min_year], ["compare-b", c.max_year]]) {
+    const sel = document.getElementById(id);
+    for (let y = c.min_year; y <= c.max_year; y++) {
+      const opt = document.createElement("option");
+      opt.value = String(y);
+      opt.textContent = String(y);
+      sel.appendChild(opt);
+    }
+    sel.value = String(val);
+  }
   const presetSel = document.getElementById("preset");
   c.presets.forEach((p) => {
     const opt = document.createElement("option");
@@ -170,6 +186,14 @@ function wireControls() {
     if (overlayLayer) overlayLayer.setOpacity(state.opacity);
     persist();
   });
+
+  document.getElementById("compare-a").addEventListener("change", (e) => {
+    state.compareA = +e.target.value; persist();
+  });
+  document.getElementById("compare-b").addEventListener("change", (e) => {
+    state.compareB = +e.target.value; persist();
+  });
+  document.getElementById("compare").addEventListener("click", compare);
 
   document.getElementById("export").addEventListener("click", exportProject);
   document.getElementById("import-btn").addEventListener("click", () =>
@@ -523,6 +547,9 @@ function setOverlay(dataUrl, bounds) {
 function clearOverlay() {
   if (overlayLayer) { map.removeLayer(overlayLayer); overlayLayer = null; }
   document.getElementById("results").hidden = true;
+  // Classify and Compare share one overlay, so clear the other view's legend too.
+  document.getElementById("transitions").innerHTML = "";
+  document.getElementById("compare-note").hidden = true;
 }
 
 function renderResults(data) {
@@ -550,6 +577,89 @@ function renderResults(data) {
     li.innerHTML = `<span class="bar" style="background:${c.color};width:${Math.max(4, pct)}px"></span>
       <span>${escapeHtml(c.name)}</span><span class="class-count">${pct}%</span>`;
     legend.appendChild(li);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Compare (change detection between two years)
+// ---------------------------------------------------------------------------
+async function compare() {
+  if (!state.center) return status("Pick a study area first.", true);
+  if (state.classes.length < 2) return status("Define at least two classes.", true);
+  if (state.points.length < 2) return status("Add some training points first.", true);
+  if (state.compareA === state.compareB) return status("Pick two different years to compare.", true);
+
+  const payload = {
+    lat: state.center.lat,
+    lon: state.center.lon,
+    training_year: state.trainingYear,
+    year_a: state.compareA,
+    year_b: state.compareB,
+    classifier: state.classifier,
+    classes: state.classes,
+    points: state.points.map((p) => ({ class: p.cls, lat: p.lat, lon: p.lon })),
+  };
+
+  setBusy(true);
+  try {
+    const r = await fetch("/api/compare", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!r.ok) return status(await errorMessage(r), true);
+    const data = await r.json();
+    setOverlay(data.image, data.bounds); // clears the single-year legend
+    renderTransitions(data);
+    persist();
+    hideStatus();
+  } catch (e) {
+    status("Network error contacting the server.", true);
+  } finally {
+    setBusy(false);
+  }
+}
+
+function renderTransitions(data) {
+  const trans = data.transitions || [];
+  // Percentages are of the total comparable area (changed + unchanged), so they
+  // read as "X% of the area went from → to" and sum to the total changed fraction.
+  const total = data.compared_pixels || 1;
+  const changed = trans.reduce((a, t) => a + t.pixels, 0);
+  const changedPct = ((changed / total) * 100).toFixed(1);
+
+  const note = document.getElementById("compare-note");
+  const acc = data.accuracy == null ? "—" : (data.accuracy * 100).toFixed(0) + "%";
+  note.textContent =
+    `Trained on ${data.training_year} · accuracy ${acc} · ` +
+    `${data.year_a} → ${data.year_b} · ${changedPct}% of area changed`;
+  note.hidden = false;
+
+  const ul = document.getElementById("transitions");
+  ul.innerHTML = "";
+  if (!trans.length) {
+    const li = document.createElement("li");
+    li.textContent = `No class changes between ${data.year_a} and ${data.year_b}.`;
+    ul.appendChild(li);
+    return;
+  }
+  // Scale bars to the largest transition so small (but real) changes stay visible.
+  const MAX_BAR_PX = 100;
+  const maxPixels = Math.max(...trans.map((t) => t.pixels));
+  trans.forEach((t) => {
+    const pct = ((t.pixels / total) * 100).toFixed(1);
+    const li = document.createElement("li");
+    const bar = document.createElement("span");
+    bar.className = "bar";
+    bar.style.background = t.color;
+    bar.style.width = Math.max(6, Math.round((t.pixels / maxPixels) * MAX_BAR_PX)) + "px";
+    const label = document.createElement("span");
+    label.textContent = `${t.from} → ${t.to}`; // textContent — injection-safe
+    const count = document.createElement("span");
+    count.className = "class-count";
+    count.textContent = pct + "%";
+    li.append(bar, label, count);
+    ul.appendChild(li);
   });
 }
 
@@ -586,7 +696,14 @@ function updateTrainBtn() {
 function setBusy(busy) {
   document.getElementById("train").disabled = busy;
   document.getElementById("year").disabled = busy;
+  document.getElementById("compare").disabled = busy;
   if (busy) status("Reading embeddings and classifying… the first look at a new area can take ~30 s.");
+}
+
+// Keeps the Compare card's year dropdowns in sync with state.
+function syncCompareUI() {
+  document.getElementById("compare-a").value = String(state.compareA);
+  document.getElementById("compare-b").value = String(state.compareB);
 }
 
 function status(msg, isError) {
@@ -627,6 +744,7 @@ function snapshot() {
   return {
     center: state.center, classes: state.classes, points: state.points,
     trainingYear: state.trainingYear, targetYear: state.targetYear,
+    compareA: state.compareA, compareB: state.compareB,
     trainedYear: state.trainedYear,
     classifier: state.classifier, opacity: state.opacity,
   };
@@ -656,6 +774,8 @@ function applyProject(p) {
   // `shownYear` fallback keeps projects saved before the train/target split loading.
   state.targetYear = p.targetYear ?? p.shownYear ?? state.config.default_year;
   state.trainingYear = p.trainingYear ?? state.config.default_year;
+  state.compareA = p.compareA ?? state.config.min_year;
+  state.compareB = p.compareB ?? state.config.max_year;
   state.trainedYear = p.trainedYear ?? null;
   state.classifier = p.classifier || "rf";
   state.opacity = p.opacity ?? 0.7;
@@ -687,6 +807,7 @@ function importProject(e) {
       renderPoints();
       if (state.center) goToArea(state.center.lat, state.center.lon, false);
       syncTrainUI();
+      syncCompareUI();
       syncYearUI();
       persist();
       status("Project loaded.");
