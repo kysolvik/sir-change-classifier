@@ -90,10 +90,12 @@ body { background: var(--bg); color: var(--ink); }
 .swatch-input::-moz-color-swatch { border: none; border-radius: 3px; }
 .class-name-input {
   flex: 1; min-width: 0; font-size: 14px; font-family: inherit; color: var(--ink);
-  padding: 2px 4px; border: 1px solid transparent; border-radius: 6px; background: transparent;
+  padding: 2px 4px; border: 1px solid transparent; border-radius: 6px;
+  background: transparent; cursor: pointer; /* reads as plain text until editing */
 }
-.class-name-input:hover { border-color: var(--line); }
-.class-name-input:focus { border-color: var(--accent); background: #fff; outline: none; }
+.class-name-input:not(:read-only) {
+  cursor: text; border-color: var(--accent); background: #fff; outline: none;
+}
 .class-count { font-size: 12px; color: var(--muted); }
 .class-del { border: none; background: none; color: var(--muted); cursor: pointer; font-size: 16px; line-height: 1; padding: 0 2px; }
 .class-del:hover { color: #d33; }

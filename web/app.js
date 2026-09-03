@@ -205,7 +205,7 @@ function wireControls() {
   document.addEventListener("keydown", (e) => {
     if (/^[1-9]$/.test(e.key) && document.activeElement.tagName !== "INPUT") {
       const i = +e.key - 1;
-      if (i < state.classes.length) { state.selected = i; renderClasses(); }
+      if (i < state.classes.length) selectClass(i);
     }
   });
 }
@@ -408,12 +408,25 @@ function renderClasses() {
     name.className = "class-name-input";
     name.value = c.name; // set as a property, not innerHTML — injection-safe
     name.maxLength = 24;
-    name.title = "rename class";
-    name.addEventListener("click", (e) => e.stopPropagation());
-    name.addEventListener("change", (e) => { e.stopPropagation(); renameClass(i, e.target.value); });
-    name.addEventListener("keydown", (e) => {
+    name.readOnly = true; // reads as plain text; single click selects the row
+    name.title = "double-click to rename";
+    // Double-click switches to edit mode (single click bubbles up to select).
+    name.addEventListener("dblclick", (e) => {
       e.stopPropagation();
-      if (e.key === "Enter") e.target.blur(); // commit via the change handler
+      name.readOnly = false;
+      name.focus();
+      name.select();
+    });
+    name.addEventListener("keydown", (e) => {
+      if (name.readOnly) return; // not editing — let shortcuts (number keys) through
+      e.stopPropagation();
+      if (e.key === "Enter") name.blur();
+      if (e.key === "Escape") { name.value = c.name; name.blur(); }
+    });
+    name.addEventListener("blur", () => {
+      if (name.readOnly) return;
+      name.readOnly = true;
+      renameClass(i, name.value); // validates, reverts dupes/empties, re-renders
     });
 
     const count = document.createElement("span");
@@ -428,10 +441,18 @@ function renderClasses() {
     li.append(swatch, name, count, del);
     li.addEventListener("click", (e) => {
       if (e.target.classList.contains("class-del")) { removeClass(i); return; }
-      state.selected = i; renderClasses();
+      selectClass(i);
     });
     ul.appendChild(li);
   });
+}
+
+// Selecting is the frequent action, so do it in place (no full re-render) — a
+// rebuild would destroy the row between clicks and break double-click-to-rename.
+function selectClass(i) {
+  state.selected = i;
+  document.querySelectorAll("#class-list .class-row")
+    .forEach((li, j) => li.classList.toggle("active", j === i));
 }
 
 function renameClass(i, rawValue) {
