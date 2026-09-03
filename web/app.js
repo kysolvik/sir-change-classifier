@@ -221,17 +221,69 @@ function renderClasses() {
   state.classes.forEach((c, i) => {
     const li = document.createElement("li");
     li.className = "class-row" + (i === state.selected ? " active" : "");
-    li.innerHTML = `
-      <span class="swatch" style="background:${c.color}"></span>
-      <span class="class-name">${escapeHtml(c.name)}</span>
-      <span class="class-count">${counts[c.name] || 0} pts</span>
-      <button class="class-del" title="remove class">&times;</button>`;
+
+    const swatch = document.createElement("input");
+    swatch.type = "color";
+    swatch.className = "swatch-input";
+    swatch.value = c.color;
+    swatch.title = "class colour";
+    swatch.addEventListener("click", (e) => e.stopPropagation());
+    swatch.addEventListener("input", (e) => { e.stopPropagation(); recolorClass(i, e.target.value); });
+
+    const name = document.createElement("input");
+    name.type = "text";
+    name.className = "class-name-input";
+    name.value = c.name; // set as a property, not innerHTML — injection-safe
+    name.maxLength = 24;
+    name.title = "rename class";
+    name.addEventListener("click", (e) => e.stopPropagation());
+    name.addEventListener("change", (e) => { e.stopPropagation(); renameClass(i, e.target.value); });
+    name.addEventListener("keydown", (e) => {
+      e.stopPropagation();
+      if (e.key === "Enter") e.target.blur(); // commit via the change handler
+    });
+
+    const count = document.createElement("span");
+    count.className = "class-count";
+    count.textContent = `${counts[c.name] || 0} pts`;
+
+    const del = document.createElement("button");
+    del.className = "class-del";
+    del.title = "remove class";
+    del.innerHTML = "&times;";
+
+    li.append(swatch, name, count, del);
     li.addEventListener("click", (e) => {
       if (e.target.classList.contains("class-del")) { removeClass(i); return; }
       state.selected = i; renderClasses();
     });
     ul.appendChild(li);
   });
+}
+
+function renameClass(i, rawValue) {
+  const oldName = state.classes[i].name;
+  const name = rawValue.trim();
+  if (!name || name === oldName) return renderClasses(); // revert the input
+  if (state.classes.some((c, j) => j !== i && c.name === name)) {
+    status("That class already exists.", true);
+    return renderClasses(); // revert the input to the old name
+  }
+  state.classes[i].name = name;
+  state.points.forEach((p) => { if (p.cls === oldName) p.cls = name; });
+  markDirty();
+  renderClasses();
+  renderPoints();
+  persist();
+}
+
+function recolorClass(i, color) {
+  state.classes[i].color = color;
+  renderPoints(); // recolour the markers
+  // Live-update the legend swatch if results are showing (i-th li matches class i).
+  const bar = document.getElementById("legend").children[i]?.querySelector(".bar");
+  if (bar) bar.style.background = color;
+  persist();
 }
 
 // ---------------------------------------------------------------------------

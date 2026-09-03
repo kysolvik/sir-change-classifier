@@ -77,8 +77,19 @@ body { background: var(--bg); color: var(--ink); }
 }
 .class-row:hover { background: #f4f7fb; }
 .class-row.active { border-color: var(--accent); background: #eef4ff; }
-.swatch { width: 16px; height: 16px; border-radius: 4px; border: 1px solid rgba(0,0,0,.15); flex: 0 0 auto; }
-.class-name { flex: 1; font-size: 14px; }
+.swatch-input {
+  width: 18px; height: 18px; flex: 0 0 auto; padding: 0; cursor: pointer;
+  border: 1px solid rgba(0,0,0,.15); border-radius: 4px; background: none;
+}
+.swatch-input::-webkit-color-swatch-wrapper { padding: 0; }
+.swatch-input::-webkit-color-swatch { border: none; border-radius: 3px; }
+.swatch-input::-moz-color-swatch { border: none; border-radius: 3px; }
+.class-name-input {
+  flex: 1; min-width: 0; font-size: 14px; font-family: inherit; color: var(--ink);
+  padding: 2px 4px; border: 1px solid transparent; border-radius: 6px; background: transparent;
+}
+.class-name-input:hover { border-color: var(--line); }
+.class-name-input:focus { border-color: var(--accent); background: #fff; outline: none; }
 .class-count { font-size: 12px; color: var(--muted); }
 .class-del { border: none; background: none; color: var(--muted); cursor: pointer; font-size: 16px; line-height: 1; padding: 0 2px; }
 .class-del:hover { color: #d33; }
