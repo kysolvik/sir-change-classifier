@@ -68,6 +68,10 @@ body { background: var(--bg); color: var(--ink); }
 .btn.small { width: auto; flex: 1; padding: 7px 10px; font-size: 13px; }
 .btn.ghost { background: transparent; }
 .btn:disabled { opacity: .55; cursor: not-allowed; }
+/* Ring marks the action whose result is currently shown on the map. */
+.btn.active { box-shadow: 0 0 0 2px var(--panel), 0 0 0 4px var(--accent); }
+/* The Train button keeps a check once a model has been trained. */
+.btn.trained::after { content: " ✓"; font-weight: 700; }
 
 /* --- Classes --- */
 .class-list { list-style: none; margin: 0 0 10px; padding: 0; }

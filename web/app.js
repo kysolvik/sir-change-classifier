@@ -173,13 +173,14 @@ function wireControls() {
     markDirty(); syncYearUI(); persist();
   });
   document.getElementById("train").addEventListener("click", () => classify(true));
+  document.getElementById("classify").addEventListener("click", () => {
+    if (!state.classifiedOnce) return status("Train a model first (step 4).", true);
+    classify(false);
+  });
 
   const yr = document.getElementById("year");
   yr.addEventListener("input", (e) => { state.targetYear = +e.target.value; syncYearUI(); });
-  yr.addEventListener("change", () => {
-    if (state.trainedYear != null && state.classifiedOnce) classify(false);
-    persist();
-  });
+  yr.addEventListener("change", () => persist());
 
   document.getElementById("opacity").addEventListener("input", (e) => {
     state.opacity = e.target.value / 100;
@@ -525,6 +526,7 @@ async function classify(train) {
     if (train) { state.trainedYear = trainingYear; state.classifiedOnce = true; }
     setOverlay(data.image, data.bounds);
     renderResults(data);
+    setActiveAction(train ? "train" : "classify");
     state.dirty = false;
     updateTrainBtn();
     syncYearUI();
@@ -550,6 +552,7 @@ function clearOverlay() {
   // Classify and Compare share one overlay, so clear the other view's legend too.
   document.getElementById("transitions").innerHTML = "";
   document.getElementById("compare-note").hidden = true;
+  setActiveAction(null); // nothing on the map now
 }
 
 function renderResults(data) {
@@ -611,6 +614,7 @@ async function compare() {
     const data = await r.json();
     setOverlay(data.image, data.bounds); // clears the single-year legend
     renderTransitions(data);
+    setActiveAction("compare");
     persist();
     hideStatus();
   } catch (e) {
@@ -673,8 +677,8 @@ function syncYearUI() {
   note.textContent = state.trainedYear != null ? `trained on ${state.trainedYear}` : "";
   const hint = document.getElementById("classify-hint");
   hint.textContent = state.classifiedOnce
-    ? "Move the year slider to map any year with your trained model."
-    : "Train a model (step 4) first, then slide to map any year.";
+    ? "Pick a year and click Classify to map it."
+    : "Train a model (step 4) first.";
 }
 
 // Keeps the Train card's controls (year dropdown + button) in sync with state.
@@ -691,13 +695,23 @@ function updateTrainBtn() {
   const btn = document.getElementById("train");
   btn.textContent = state.classifiedOnce && state.dirty ? "Re-train model" : "Train model";
   btn.classList.toggle("dirty", state.classifiedOnce && state.dirty);
+  btn.classList.toggle("trained", state.classifiedOnce); // persistent check once trained
 }
 
 function setBusy(busy) {
   document.getElementById("train").disabled = busy;
+  document.getElementById("classify").disabled = busy;
   document.getElementById("year").disabled = busy;
   document.getElementById("compare").disabled = busy;
   if (busy) status("Reading embeddings and classifying… the first look at a new area can take ~30 s.");
+}
+
+// Highlights the action whose result is currently on the map (Train / Classify /
+// Compare), so users can see what they're looking at. Pass null to clear.
+function setActiveAction(name) {
+  for (const id of ["train", "classify", "compare"]) {
+    document.getElementById(id).classList.toggle("active", id === name);
+  }
 }
 
 // Keeps the Compare card's year dropdowns in sync with state.
