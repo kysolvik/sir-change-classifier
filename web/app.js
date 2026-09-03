@@ -152,7 +152,9 @@ function wireControls() {
     state.classifier = e.target.value; markDirty(); persist();
   });
   document.getElementById("train-year").addEventListener("change", (e) => {
-    state.trainingYear = +e.target.value; markDirty(); persist();
+    state.trainingYear = +e.target.value;
+    state.targetYear = state.trainingYear; // classify year matches the train year by default
+    markDirty(); syncYearUI(); persist();
   });
   document.getElementById("train").addEventListener("click", () => classify(true));
 
@@ -204,8 +206,10 @@ function goToArea(lat, lon, newArea) {
     state.trainedYear = null;
     state.classifiedOnce = false;
     state.dirty = false;
-    // Fallback training year until the Esri imagery date arrives and seeds it.
+    // Fallback training + matching classify year until the Esri imagery date
+    // arrives and seeds them.
     state.trainingYear = state.config.default_year;
+    state.targetYear = state.config.default_year;
     document.getElementById("train-accuracy").hidden = true;
     renderClasses(); // per-class counts back to 0
     renderPoints();  // clear the markers
@@ -290,16 +294,18 @@ async function fetchImageryDate(lat, lon, seed) {
     if (reqId !== imageryReqId) return; // a newer area superseded this request
     const year = imageryYear(data);
     el.textContent = year
-      ? `Basemap imagery here: ~${year} — Esri mosaic, not tied to the data year you're classifying.`
+      ? `Basemap imagery here: ${year}.`
       : IMAGERY_FALLBACK;
     // Suggest labelling on the year you actually see, and seed it on a new area.
     const hint = document.getElementById("train-year-hint");
     if (year) {
       const clamped = Math.min(state.config.max_year, Math.max(state.config.min_year, +year));
-      hint.textContent = `Tip: match the basemap imagery (~${year}) you're labelling.`;
+      hint.textContent = `Tip: match the satellite imagery (here: ${year}) you're labelling.`;
       if (seed) {
         state.trainingYear = clamped;
+        state.targetYear = clamped; // classify year matches the train year by default
         syncTrainUI();
+        syncYearUI();
         markDirty(); // a re-train is needed if a model already existed
         persist();
       }
