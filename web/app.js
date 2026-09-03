@@ -294,7 +294,7 @@ async function fetchImageryDate(lat, lon, seed) {
     if (reqId !== imageryReqId) return; // a newer area superseded this request
     const year = imageryYear(data);
     el.textContent = year
-      ? `Basemap imagery here: ${year}.`
+      ? `Satellite basemap imagery here is from: ${year}.`
       : IMAGERY_FALLBACK;
     // Suggest labelling on the year you actually see, and seed it on a new area.
     const hint = document.getElementById("train-year-hint");
