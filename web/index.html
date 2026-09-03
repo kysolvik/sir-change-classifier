@@ -57,16 +57,26 @@
         </div>
       </section>
 
-      <!-- 4. Classify -->
+      <!-- 4. Train the model -->
       <section class="card">
-        <h2><span class="step">4</span> Classify</h2>
+        <h2><span class="step">4</span> Train the model</h2>
         <label class="field"><span>Method</span>
           <select id="classifier">
             <option value="rf">Random forest</option>
             <option value="knn">K-nearest neighbours</option>
           </select>
         </label>
-        <button id="classify" class="btn primary">Train &amp; classify</button>
+        <label class="field"><span>Training year</span>
+          <select id="train-year"></select>
+        </label>
+        <p class="hint" id="train-year-hint"></p>
+        <button id="train" class="btn primary">Train model</button>
+        <p class="hint" id="train-accuracy" hidden></p>
+      </section>
+
+      <!-- 5. Classify -->
+      <section class="card">
+        <h2><span class="step">5</span> Classify</h2>
         <div class="year-block">
           <div class="year-head">
             <span>Year: <b id="year-label">2025</b></span>
@@ -78,6 +88,7 @@
           <span>Overlay opacity</span>
           <input id="opacity" type="range" min="0" max="100" step="5" value="70" />
         </label>
+        <p class="hint" id="classify-hint">Train a model (step 4) first, then slide to map any year.</p>
       </section>
 
       <!-- Results -->
