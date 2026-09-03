@@ -195,6 +195,7 @@ function goToArea(lat, lon, newArea) {
     updateClassifyBtn();
     syncYearUI();
   }
+  fetchImageryDate(lat, lon);
   persist();
 }
 
@@ -233,6 +234,62 @@ function showAreaMenu(latlng) {
     goToArea(lat, lon, true);
     map.closePopup(popup);
   });
+}
+
+// The Esri basemap is an undated multi-date mosaic. Ask Esri's token-free identify
+// op for the acquisition date of the imagery under the box centre and label it a
+// mosaic, so students don't assume it matches the AEF year they're classifying.
+// Display-only; any failure degrades to an honest note.
+const IMAGERY_FALLBACK =
+  "Basemap is a multi-date Esri mosaic — not year-matched to the data.";
+let imageryReqId = 0;
+
+async function fetchImageryDate(lat, lon) {
+  const el = document.getElementById("imagery-date");
+  if (!el) return;
+  const reqId = ++imageryReqId; // guard against a stale response for an old area
+  el.textContent = "Checking Esri imagery date…";
+  try {
+    const size = map.getSize();
+    const params = new URLSearchParams({
+      f: "json",
+      geometry: `${lon},${lat}`,
+      geometryType: "esriGeometryPoint",
+      sr: "4326",
+      layers: "all:0", // the World Imagery footprint layer
+      tolerance: "1",
+      returnGeometry: "false",
+      mapExtent: [
+        boxBounds.getWest(), boxBounds.getSouth(),
+        boxBounds.getEast(), boxBounds.getNorth(),
+      ].join(","),
+      imageDisplay: `${size.x},${size.y},96`,
+    });
+    const r = await fetch(
+      "https://services.arcgisonline.com/arcgis/rest/services/World_Imagery/MapServer/identify?" +
+        params
+    );
+    const data = await r.json();
+    if (reqId !== imageryReqId) return; // a newer area superseded this request
+    const year = imageryYear(data);
+    el.textContent = year
+      ? `Basemap imagery here: ~${year} — Esri mosaic, not tied to the data year you're classifying.`
+      : IMAGERY_FALLBACK;
+  } catch (e) {
+    if (reqId === imageryReqId) el.textContent = IMAGERY_FALLBACK;
+  }
+}
+
+function imageryYear(data) {
+  const results = (data && data.results) || [];
+  for (const res of results) {
+    const d = res.attributes && res.attributes.SRC_DATE2;
+    if (d) {
+      const year = String(d).split("/").pop(); // "8/29/2025" -> "2025"
+      if (/^\d{4}$/.test(year)) return year;
+    }
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
