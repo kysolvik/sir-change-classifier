@@ -62,6 +62,21 @@ function setupMap() {
   markers.addTo(map);
 
   map.on("click", (e) => onMapClick(e.latlng));
+
+  // Right-click opens a small confirm menu at the cursor (rather than moving the
+  // box instantly, which is easy to trigger by accident and would orphan any
+  // points placed in the old area). Left-click still adds points; Leaflet's
+  // contextmenu already suppresses the browser menu.
+  map.on("contextmenu", (e) => showAreaMenu(e.latlng));
+
+  // Live coordinate readout in the map's bottom-left corner.
+  const coords = document.getElementById("coords");
+  map.on("mousemove", (e) => {
+    const ll = e.latlng.wrap();
+    coords.textContent = `${ll.lat.toFixed(4)}, ${ll.lng.toFixed(4)}`;
+    coords.hidden = false;
+  });
+  map.on("mouseout", () => { coords.hidden = true; });
 }
 
 async function loadConfig() {
@@ -157,7 +172,9 @@ function wireControls() {
 // ---------------------------------------------------------------------------
 // Study area
 // ---------------------------------------------------------------------------
-function goToArea(lat, lon, resetOverlay) {
+// `newArea` distinguishes a deliberate move to a fresh area (preset / Go /
+// right-click) from merely restoring a saved project (init / import).
+function goToArea(lat, lon, newArea) {
   state.center = { lat, lon };
   boxBounds = L.latLngBounds(kmBox(lat, lon, state.config.box_size_km));
   if (boxLayer) map.removeLayer(boxLayer);
@@ -165,10 +182,17 @@ function goToArea(lat, lon, resetOverlay) {
     color: "#ffd400", weight: 2, dashArray: "6", fill: false, interactive: false,
   }).addTo(map);
   map.fitBounds(boxBounds, { padding: [20, 20] });
-  if (resetOverlay) {
+  if (newArea) {
+    // Moving resets the project — points belong to the old location and would be
+    // meaningless here. Named classes (and their colours) are kept for reuse.
+    state.points = [];
     clearOverlay();
     state.trainedYear = null;
     state.classifiedOnce = false;
+    state.dirty = false;
+    renderClasses(); // per-class counts back to 0
+    renderPoints();  // clear the markers
+    updateClassifyBtn();
     syncYearUI();
   }
   persist();
@@ -179,6 +203,36 @@ function kmBox(lat, lon, km) {
   const dLat = half / 110.574;
   const dLon = half / (111.32 * Math.cos((lat * Math.PI) / 180));
   return [[lat - dLat, lon - dLon], [lat + dLat, lon + dLon]];
+}
+
+// Confirmation popup for a right-click, so the box only moves on a deliberate
+// second click. Warns that moving clears the existing points.
+function showAreaMenu(latlng) {
+  const ll = latlng.wrap(); // keep lon in -180..180 for the backend/inputs
+  const lat = +ll.lat.toFixed(5), lon = +ll.lng.toFixed(5);
+  const moving = state.center != null;
+  const n = state.points.length;
+  const warn = moving && n
+    ? `<p class="map-menu-warn">WARNING: Moving the box deletes all (${n}) training point${n === 1 ? "" : "s"}.</p>`
+    : "";
+
+  const div = document.createElement("div");
+  div.className = "map-menu";
+  div.innerHTML =
+    `<div class="map-menu-coord">${lat.toFixed(4)}, ${lon.toFixed(4)}</div>${warn}` +
+    `<button class="btn small" type="button">${moving ? "Move" : "Place"} study box here</button>`;
+
+  const popup = L.popup({ className: "map-menu-popup", closeButton: false, offset: [0, 0] })
+    .setLatLng(latlng)
+    .setContent(div)
+    .openOn(map);
+
+  div.querySelector("button").addEventListener("click", () => {
+    document.getElementById("lat").value = lat;
+    document.getElementById("lon").value = lon;
+    goToArea(lat, lon, true);
+    map.closePopup(popup);
+  });
 }
 
 // ---------------------------------------------------------------------------
