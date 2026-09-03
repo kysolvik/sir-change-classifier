@@ -39,6 +39,19 @@ class ClassifyResult:
     used_flags: list[bool] = field(default_factory=list)  # per input point
 
 
+@dataclass
+class TrainedModel:
+    """A fitted classifier plus the metadata needed to apply and report on it."""
+
+    model: object
+    classifier: str
+    accuracy: float | None
+    n_classes: int
+    n_points_used: int
+    n_points_skipped: int
+    used_flags: list[bool] = field(default_factory=list)  # per input point
+
+
 def sample_points(win: EmbeddingWindow, points, class_to_idx):
     """Return (X, y, used_flags) sampling the embedding at each point.
 
@@ -103,13 +116,13 @@ def _predict_full(model, win: EmbeddingWindow, classifier: str) -> np.ndarray:
     return out.reshape(h, w)
 
 
-def train_and_predict(
+def train_model(
     train_win: EmbeddingWindow,
-    target_win: EmbeddingWindow,
     points,
     classes: list[str],
     classifier: str = "rf",
-) -> ClassifyResult:
+) -> TrainedModel:
+    """Sample the training-year embedding at each point and fit a classifier."""
     class_to_idx = {name: i for i, name in enumerate(classes)}
     X, y, used = sample_points(train_win, points, class_to_idx)
 
@@ -124,16 +137,68 @@ def train_and_predict(
     accuracy = _accuracy(_build_model(classifier, X.shape[0]), Xf, y)
     model.fit(Xf, y)
 
-    labels = _predict_full(model, target_win, classifier)
+    return TrainedModel(
+        model=model,
+        classifier=classifier,
+        accuracy=accuracy,
+        n_classes=len(classes),
+        n_points_used=int(X.shape[0]),
+        n_points_skipped=int(len(used) - X.shape[0]),
+        used_flags=used,
+    )
+
+
+def predict_window(trained: TrainedModel, win: EmbeddingWindow) -> np.ndarray:
+    """Apply a trained model to a full window, returning an (H, W) int16 label map."""
+    return _predict_full(trained.model, win, trained.classifier)
+
+
+def train_and_predict(
+    train_win: EmbeddingWindow,
+    target_win: EmbeddingWindow,
+    points,
+    classes: list[str],
+    classifier: str = "rf",
+) -> ClassifyResult:
+    trained = train_model(train_win, points, classes, classifier)
+    labels = predict_window(trained, target_win)
 
     idx_vals, idx_counts = np.unique(labels[labels >= 0], return_counts=True)
     counts = {int(i): int(c) for i, c in zip(idx_vals, idx_counts)}
     return ClassifyResult(
         labels=labels,
-        n_classes=len(classes),
-        accuracy=accuracy,
+        n_classes=trained.n_classes,
+        accuracy=trained.accuracy,
         class_pixel_counts=counts,
-        n_points_used=int(X.shape[0]),
-        n_points_skipped=int(len(used) - X.shape[0]),
-        used_flags=used,
+        n_points_used=trained.n_points_used,
+        n_points_skipped=trained.n_points_skipped,
+        used_flags=trained.used_flags,
     )
+
+
+def transition_map(
+    labels_a: np.ndarray, labels_b: np.ndarray, k: int
+) -> tuple[np.ndarray, list[tuple[int, int, int]], int]:
+    """Encode per-pixel class change between two label maps.
+
+    A pixel that is valid (>= 0) in both years and whose class changed gets id
+    ``from * k + to``; unchanged or nodata pixels get ``-1`` (transparent).
+    Returns ``(ids, observed, n_comparable)`` where ``observed`` is the list of
+    ``(from, to, pixels)`` sorted by area desc (the legend) and ``n_comparable``
+    is the count of pixels valid in *both* years — the denominator for "what
+    fraction of the area changed" (changed + unchanged, excluding nodata).
+    """
+    comparable = (labels_a >= 0) & (labels_b >= 0)
+    changed = comparable & (labels_a != labels_b)
+    ids = np.full(labels_a.shape, -1, dtype=np.int32)
+    a = labels_a.astype(np.int32)
+    b = labels_b.astype(np.int32)
+    ids[changed] = a[changed] * k + b[changed]
+
+    uniq, counts = np.unique(ids[changed], return_counts=True)
+    order = np.argsort(-counts)
+    observed = [
+        (int(u // k), int(u % k), int(c))
+        for u, c in zip(uniq[order], counts[order])
+    ]
+    return ids, observed, int(comparable.sum())

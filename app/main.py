@@ -41,18 +41,17 @@ class PointSpec(BaseModel):
     model_config = {"populate_by_name": True}
 
 
-class ClassifyRequest(BaseModel):
+class _ClassifyBase(BaseModel):
+    """Fields + validation shared by /api/classify and /api/compare."""
+
     lat: float = Field(ge=-90, le=90)
     lon: float = Field(ge=-180, le=180)
-    training_year: int
-    target_year: int
     classifier: Literal["rf", "knn"] = "rf"
     classes: list[ClassSpec]
     points: list[PointSpec]
 
-    @field_validator("training_year", "target_year")
-    @classmethod
-    def _year_in_range(cls, v: int) -> int:
+    @staticmethod
+    def _check_year(v: int) -> int:
         if v not in config.YEARS:
             raise ValueError(f"year must be in {config.MIN_YEAR}-{config.MAX_YEAR}")
         return v
@@ -73,6 +72,34 @@ class ClassifyRequest(BaseModel):
         if len(v) > config.MAX_POINTS:
             raise ValueError(f"at most {config.MAX_POINTS} points")
         return v
+
+
+class ClassifyRequest(_ClassifyBase):
+    training_year: int
+    target_year: int
+
+    @field_validator("training_year", "target_year")
+    @classmethod
+    def _years(cls, v: int) -> int:
+        return cls._check_year(v)
+
+
+class CompareRequest(_ClassifyBase):
+    training_year: int
+    year_a: int
+    year_b: int
+
+    @field_validator("training_year", "year_a", "year_b")
+    @classmethod
+    def _years(cls, v: int) -> int:
+        return cls._check_year(v)
+
+
+def _require_known_point_classes(body: _ClassifyBase) -> None:
+    names = {c.name for c in body.classes}
+    for p in body.points:
+        if p.cls not in names:
+            raise HTTPException(400, f"point references unknown class '{p.cls}'")
 
 
 @contextlib.asynccontextmanager
@@ -115,10 +142,7 @@ def create_app() -> FastAPI:
     @app.post("/api/classify")
     @limiter.limit(config.RATE_LIMIT)
     async def do_classify(request: Request, body: ClassifyRequest) -> JSONResponse:
-        names = {c.name for c in body.classes}
-        for p in body.points:
-            if p.cls not in names:
-                raise HTTPException(400, f"point references unknown class '{p.cls}'")
+        _require_known_point_classes(body)
 
         box = geo.build_box(body.lon, body.lat)
         try:
@@ -163,6 +187,75 @@ def create_app() -> FastAPI:
                 "class_pixel_counts": {
                     class_names[i]: c for i, c in result.class_pixel_counts.items()
                 },
+            }
+        )
+
+    @app.post("/api/compare")
+    @limiter.limit(config.RATE_LIMIT)
+    async def do_compare(request: Request, body: CompareRequest) -> JSONResponse:
+        _require_known_point_classes(body)
+
+        box = geo.build_box(body.lon, body.lat)
+        try:
+            train_win = await cache.get_or_read(box, body.training_year)
+            win_a = (
+                train_win
+                if body.year_a == body.training_year
+                else await cache.get_or_read(box, body.year_a)
+            )
+            if body.year_b == body.training_year:
+                win_b = train_win
+            elif body.year_b == body.year_a:
+                win_b = win_a
+            else:
+                win_b = await cache.get_or_read(box, body.year_b)
+        except embeddings.NoDataError as exc:
+            raise HTTPException(422, str(exc))
+
+        class_names = [c.name for c in body.classes]
+        try:
+            trained = await asyncio.to_thread(
+                classify.train_model, train_win, body.points, class_names, body.classifier
+            )
+            labels_a = await asyncio.to_thread(classify.predict_window, trained, win_a)
+            labels_b = await asyncio.to_thread(classify.predict_window, trained, win_b)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+
+        ids, observed, compared_pixels = classify.transition_map(
+            labels_a, labels_b, len(class_names)
+        )
+        palette = colorize.transition_palette(len(observed))
+        color_by_id = {}
+        transitions = []
+        for (frm, to, pixels), color in zip(observed, palette):
+            color_by_id[frm * len(class_names) + to] = color
+            transitions.append(
+                {
+                    "from": class_names[frm],
+                    "to": class_names[to],
+                    "color": color,
+                    "pixels": pixels,
+                }
+            )
+
+        png = await asyncio.to_thread(colorize.ids_to_png, ids, color_by_id)
+        data_url = "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+        min_lon, min_lat, max_lon, max_lat = box.lonlat_bounds()
+
+        return JSONResponse(
+            {
+                "image": data_url,
+                "bounds": [[min_lat, min_lon], [max_lat, max_lon]],
+                "training_year": body.training_year,
+                "year_a": body.year_a,
+                "year_b": body.year_b,
+                "classifier": body.classifier,
+                "accuracy": trained.accuracy,
+                "n_points_used": trained.n_points_used,
+                "n_points_skipped": trained.n_points_skipped,
+                "compared_pixels": compared_pixels,
+                "transitions": transitions,
             }
         )
 

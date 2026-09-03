@@ -15,7 +15,10 @@ const state = {
   classes: [],           // [{name, color}]
   selected: 0,
   points: [],            // [{lat, lon, cls}]
-  shownYear: 2025,
+  trainingYear: 2025,    // year the points are labelled/trained on
+  targetYear: 2025,      // year being classified/displayed
+  compareA: 2017,        // Compare card: first year
+  compareB: 2025,        // Compare card: second year
   trainedYear: null,
   classifier: "rf",
   opacity: 0.7,
@@ -39,6 +42,8 @@ async function init() {
   renderClasses();
   renderPoints();
   if (state.center) goToArea(state.center.lat, state.center.lon, false);
+  syncTrainUI();
+  syncCompareUI();
   syncYearUI();
 }
 
@@ -62,6 +67,21 @@ function setupMap() {
   markers.addTo(map);
 
   map.on("click", (e) => onMapClick(e.latlng));
+
+  // Right-click opens a small confirm menu at the cursor (rather than moving the
+  // box instantly, which is easy to trigger by accident and would orphan any
+  // points placed in the old area). Left-click still adds points; Leaflet's
+  // contextmenu already suppresses the browser menu.
+  map.on("contextmenu", (e) => showAreaMenu(e.latlng));
+
+  // Live coordinate readout in the map's bottom-left corner.
+  const coords = document.getElementById("coords");
+  map.on("mousemove", (e) => {
+    const ll = e.latlng.wrap();
+    coords.textContent = `${ll.lat.toFixed(4)}, ${ll.lng.toFixed(4)}`;
+    coords.hidden = false;
+  });
+  map.on("mouseout", () => { coords.hidden = true; });
 }
 
 async function loadConfig() {
@@ -72,13 +92,35 @@ async function loadConfig() {
     return status("Could not load configuration from the server.", true);
   }
   const c = state.config;
-  state.shownYear = c.default_year;
+  state.targetYear = c.default_year;
+  state.trainingYear = c.default_year;
   state.classifier = c.default_classifier || "rf";
   document.getElementById("box-km").textContent = c.box_size_km;
   const yr = document.getElementById("year");
   yr.min = c.min_year;
   yr.max = c.max_year;
   yr.value = c.default_year;
+  const trainYr = document.getElementById("train-year");
+  for (let y = c.min_year; y <= c.max_year; y++) {
+    const opt = document.createElement("option");
+    opt.value = String(y);
+    opt.textContent = String(y);
+    trainYr.appendChild(opt);
+  }
+  trainYr.value = String(c.default_year);
+  // Compare card: two year dropdowns spanning the full range (earliest → latest).
+  state.compareA = c.min_year;
+  state.compareB = c.max_year;
+  for (const [id, val] of [["compare-a", c.min_year], ["compare-b", c.max_year]]) {
+    const sel = document.getElementById(id);
+    for (let y = c.min_year; y <= c.max_year; y++) {
+      const opt = document.createElement("option");
+      opt.value = String(y);
+      opt.textContent = String(y);
+      sel.appendChild(opt);
+    }
+    sel.value = String(val);
+  }
   const presetSel = document.getElementById("preset");
   c.presets.forEach((p) => {
     const opt = document.createElement("option");
@@ -125,20 +167,34 @@ function wireControls() {
   document.getElementById("classifier").addEventListener("change", (e) => {
     state.classifier = e.target.value; markDirty(); persist();
   });
-  document.getElementById("classify").addEventListener("click", () => classify(true));
+  document.getElementById("train-year").addEventListener("change", (e) => {
+    state.trainingYear = +e.target.value;
+    state.targetYear = state.trainingYear; // classify year matches the train year by default
+    markDirty(); syncYearUI(); persist();
+  });
+  document.getElementById("train").addEventListener("click", () => classify(true));
+  document.getElementById("classify").addEventListener("click", () => {
+    if (!state.classifiedOnce) return status("Train a model first (step 4).", true);
+    classify(false);
+  });
 
   const yr = document.getElementById("year");
-  yr.addEventListener("input", (e) => { state.shownYear = +e.target.value; syncYearUI(); });
-  yr.addEventListener("change", () => {
-    if (state.trainedYear != null && state.classifiedOnce) classify(false);
-    persist();
-  });
+  yr.addEventListener("input", (e) => { state.targetYear = +e.target.value; syncYearUI(); });
+  yr.addEventListener("change", () => persist());
 
   document.getElementById("opacity").addEventListener("input", (e) => {
     state.opacity = e.target.value / 100;
     if (overlayLayer) overlayLayer.setOpacity(state.opacity);
     persist();
   });
+
+  document.getElementById("compare-a").addEventListener("change", (e) => {
+    state.compareA = +e.target.value; persist();
+  });
+  document.getElementById("compare-b").addEventListener("change", (e) => {
+    state.compareB = +e.target.value; persist();
+  });
+  document.getElementById("compare").addEventListener("click", compare);
 
   document.getElementById("export").addEventListener("click", exportProject);
   document.getElementById("import-btn").addEventListener("click", () =>
@@ -149,7 +205,7 @@ function wireControls() {
   document.addEventListener("keydown", (e) => {
     if (/^[1-9]$/.test(e.key) && document.activeElement.tagName !== "INPUT") {
       const i = +e.key - 1;
-      if (i < state.classes.length) { state.selected = i; renderClasses(); }
+      if (i < state.classes.length) selectClass(i);
     }
   });
 }
@@ -157,7 +213,9 @@ function wireControls() {
 // ---------------------------------------------------------------------------
 // Study area
 // ---------------------------------------------------------------------------
-function goToArea(lat, lon, resetOverlay) {
+// `newArea` distinguishes a deliberate move to a fresh area (preset / Go /
+// right-click) from merely restoring a saved project (init / import).
+function goToArea(lat, lon, newArea) {
   state.center = { lat, lon };
   boxBounds = L.latLngBounds(kmBox(lat, lon, state.config.box_size_km));
   if (boxLayer) map.removeLayer(boxLayer);
@@ -165,12 +223,25 @@ function goToArea(lat, lon, resetOverlay) {
     color: "#ffd400", weight: 2, dashArray: "6", fill: false, interactive: false,
   }).addTo(map);
   map.fitBounds(boxBounds, { padding: [20, 20] });
-  if (resetOverlay) {
+  if (newArea) {
+    // Moving resets the project — points belong to the old location and would be
+    // meaningless here. Named classes (and their colours) are kept for reuse.
+    state.points = [];
     clearOverlay();
     state.trainedYear = null;
     state.classifiedOnce = false;
+    state.dirty = false;
+    // Fallback training + matching classify year until the Esri imagery date
+    // arrives and seeds them.
+    state.trainingYear = state.config.default_year;
+    state.targetYear = state.config.default_year;
+    document.getElementById("train-accuracy").hidden = true;
+    renderClasses(); // per-class counts back to 0
+    renderPoints();  // clear the markers
+    syncTrainUI();   // resets the Train button + year dropdown
     syncYearUI();
   }
+  fetchImageryDate(lat, lon, newArea);
   persist();
 }
 
@@ -179,6 +250,108 @@ function kmBox(lat, lon, km) {
   const dLat = half / 110.574;
   const dLon = half / (111.32 * Math.cos((lat * Math.PI) / 180));
   return [[lat - dLat, lon - dLon], [lat + dLat, lon + dLon]];
+}
+
+// Confirmation popup for a right-click, so the box only moves on a deliberate
+// second click. Warns that moving clears the existing points.
+function showAreaMenu(latlng) {
+  const ll = latlng.wrap(); // keep lon in -180..180 for the backend/inputs
+  const lat = +ll.lat.toFixed(5), lon = +ll.lng.toFixed(5);
+  const moving = state.center != null;
+  const n = state.points.length;
+  const warn = moving && n
+    ? `<p class="map-menu-warn">WARNING: Moving the box deletes all (${n}) training point${n === 1 ? "" : "s"}.</p>`
+    : "";
+
+  const div = document.createElement("div");
+  div.className = "map-menu";
+  div.innerHTML =
+    `<div class="map-menu-coord">${lat.toFixed(4)}, ${lon.toFixed(4)}</div>${warn}` +
+    `<button class="btn small" type="button">${moving ? "Move" : "Place"} study box here</button>`;
+
+  const popup = L.popup({ className: "map-menu-popup", closeButton: false, offset: [0, 0] })
+    .setLatLng(latlng)
+    .setContent(div)
+    .openOn(map);
+
+  div.querySelector("button").addEventListener("click", () => {
+    document.getElementById("lat").value = lat;
+    document.getElementById("lon").value = lon;
+    goToArea(lat, lon, true);
+    map.closePopup(popup);
+  });
+}
+
+// The Esri basemap is an undated multi-date mosaic. Ask Esri's token-free identify
+// op for the acquisition date of the imagery under the box centre and label it a
+// mosaic, so students don't assume it matches the AEF year they're classifying.
+// Display-only; any failure degrades to an honest note.
+const IMAGERY_FALLBACK =
+  "Basemap is a multi-date Esri mosaic — not year-matched to the data.";
+let imageryReqId = 0;
+
+async function fetchImageryDate(lat, lon, seed) {
+  const el = document.getElementById("imagery-date");
+  if (!el) return;
+  const reqId = ++imageryReqId; // guard against a stale response for an old area
+  el.textContent = "Checking Esri imagery date…";
+  try {
+    const size = map.getSize();
+    const params = new URLSearchParams({
+      f: "json",
+      geometry: `${lon},${lat}`,
+      geometryType: "esriGeometryPoint",
+      sr: "4326",
+      layers: "all:0", // the World Imagery footprint layer
+      tolerance: "1",
+      returnGeometry: "false",
+      mapExtent: [
+        boxBounds.getWest(), boxBounds.getSouth(),
+        boxBounds.getEast(), boxBounds.getNorth(),
+      ].join(","),
+      imageDisplay: `${size.x},${size.y},96`,
+    });
+    const r = await fetch(
+      "https://services.arcgisonline.com/arcgis/rest/services/World_Imagery/MapServer/identify?" +
+        params
+    );
+    const data = await r.json();
+    if (reqId !== imageryReqId) return; // a newer area superseded this request
+    const year = imageryYear(data);
+    el.textContent = year
+      ? `Satellite basemap imagery here is from: ${year}.`
+      : IMAGERY_FALLBACK;
+    // Suggest labelling on the year you actually see, and seed it on a new area.
+    const hint = document.getElementById("train-year-hint");
+    if (year) {
+      const clamped = Math.min(state.config.max_year, Math.max(state.config.min_year, +year));
+      hint.textContent = `Tip: match the satellite imagery (here: ${year}) you're labelling.`;
+      if (seed) {
+        state.trainingYear = clamped;
+        state.targetYear = clamped; // classify year matches the train year by default
+        syncTrainUI();
+        syncYearUI();
+        markDirty(); // a re-train is needed if a model already existed
+        persist();
+      }
+    } else {
+      hint.textContent = "";
+    }
+  } catch (e) {
+    if (reqId === imageryReqId) el.textContent = IMAGERY_FALLBACK;
+  }
+}
+
+function imageryYear(data) {
+  const results = (data && data.results) || [];
+  for (const res of results) {
+    const d = res.attributes && res.attributes.SRC_DATE2;
+    if (d) {
+      const year = String(d).split("/").pop(); // "8/29/2025" -> "2025"
+      if (/^\d{4}$/.test(year)) return year;
+    }
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -221,17 +394,90 @@ function renderClasses() {
   state.classes.forEach((c, i) => {
     const li = document.createElement("li");
     li.className = "class-row" + (i === state.selected ? " active" : "");
-    li.innerHTML = `
-      <span class="swatch" style="background:${c.color}"></span>
-      <span class="class-name">${escapeHtml(c.name)}</span>
-      <span class="class-count">${counts[c.name] || 0} pts</span>
-      <button class="class-del" title="remove class">&times;</button>`;
+
+    const swatch = document.createElement("input");
+    swatch.type = "color";
+    swatch.className = "swatch-input";
+    swatch.value = c.color;
+    swatch.title = "class colour";
+    swatch.addEventListener("click", (e) => e.stopPropagation());
+    swatch.addEventListener("input", (e) => { e.stopPropagation(); recolorClass(i, e.target.value); });
+
+    const name = document.createElement("input");
+    name.type = "text";
+    name.className = "class-name-input";
+    name.value = c.name; // set as a property, not innerHTML — injection-safe
+    name.maxLength = 24;
+    name.readOnly = true; // reads as plain text; single click selects the row
+    name.title = "double-click to rename";
+    // Double-click switches to edit mode (single click bubbles up to select).
+    name.addEventListener("dblclick", (e) => {
+      e.stopPropagation();
+      name.readOnly = false;
+      name.focus();
+      name.select();
+    });
+    name.addEventListener("keydown", (e) => {
+      if (name.readOnly) return; // not editing — let shortcuts (number keys) through
+      e.stopPropagation();
+      if (e.key === "Enter") name.blur();
+      if (e.key === "Escape") { name.value = c.name; name.blur(); }
+    });
+    name.addEventListener("blur", () => {
+      if (name.readOnly) return;
+      name.readOnly = true;
+      renameClass(i, name.value); // validates, reverts dupes/empties, re-renders
+    });
+
+    const count = document.createElement("span");
+    count.className = "class-count";
+    count.textContent = `${counts[c.name] || 0} pts`;
+
+    const del = document.createElement("button");
+    del.className = "class-del";
+    del.title = "remove class";
+    del.innerHTML = "&times;";
+
+    li.append(swatch, name, count, del);
     li.addEventListener("click", (e) => {
       if (e.target.classList.contains("class-del")) { removeClass(i); return; }
-      state.selected = i; renderClasses();
+      selectClass(i);
     });
     ul.appendChild(li);
   });
+}
+
+// Selecting is the frequent action, so do it in place (no full re-render) — a
+// rebuild would destroy the row between clicks and break double-click-to-rename.
+function selectClass(i) {
+  state.selected = i;
+  document.querySelectorAll("#class-list .class-row")
+    .forEach((li, j) => li.classList.toggle("active", j === i));
+}
+
+function renameClass(i, rawValue) {
+  const oldName = state.classes[i].name;
+  const name = rawValue.trim();
+  if (!name || name === oldName) return renderClasses(); // revert the input
+  if (state.classes.some((c, j) => j !== i && c.name === name)) {
+    status("That class already exists.", true);
+    return renderClasses(); // revert the input to the old name
+  }
+  state.classes[i].name = name;
+  state.points.forEach((p) => { if (p.cls === oldName) p.cls = name; });
+  markDirty();
+  renderClasses();
+  renderPoints();
+  persist();
+}
+
+function recolorClass(i, color) {
+  state.classes[i].color = color;
+  renderPoints(); // recolour the markers
+  // Live-update the legend swatch if results are showing (i-th li matches class i).
+  const bar = document.getElementById("legend").children[i]?.querySelector(".bar");
+  if (bar) bar.style.background = color;
+  persist();
 }
 
 // ---------------------------------------------------------------------------
@@ -276,12 +522,14 @@ async function classify(train) {
   if (state.classes.length < 2) return status("Define at least two classes.", true);
   if (state.points.length < 2) return status("Add some training points first.", true);
 
-  const trainingYear = train ? state.shownYear : state.trainedYear ?? state.shownYear;
+  // "Train model" fits on the chosen training year; moving the target slider
+  // re-applies the already-trained model (its fixed trainedYear).
+  const trainingYear = train ? state.trainingYear : state.trainedYear ?? state.trainingYear;
   const payload = {
     lat: state.center.lat,
     lon: state.center.lon,
     training_year: trainingYear,
-    target_year: state.shownYear,
+    target_year: state.targetYear,
     classifier: state.classifier,
     classes: state.classes,
     points: state.points.map((p) => ({ class: p.cls, lat: p.lat, lon: p.lon })),
@@ -299,8 +547,9 @@ async function classify(train) {
     if (train) { state.trainedYear = trainingYear; state.classifiedOnce = true; }
     setOverlay(data.image, data.bounds);
     renderResults(data);
+    setActiveAction(train ? "train" : "classify");
     state.dirty = false;
-    updateClassifyBtn();
+    updateTrainBtn();
     syncYearUI();
     persist();
     hideStatus();
@@ -321,6 +570,10 @@ function setOverlay(dataUrl, bounds) {
 function clearOverlay() {
   if (overlayLayer) { map.removeLayer(overlayLayer); overlayLayer = null; }
   document.getElementById("results").hidden = true;
+  // Classify and Compare share one overlay, so clear the other view's legend too.
+  document.getElementById("transitions").innerHTML = "";
+  document.getElementById("compare-note").hidden = true;
+  setActiveAction(null); // nothing on the map now
 }
 
 function renderResults(data) {
@@ -331,8 +584,11 @@ function renderResults(data) {
   const skipped = data.n_points_skipped
     ? ` · <span title="points outside the box or on masked pixels">${data.n_points_skipped} skipped</span>`
     : "";
+  // Accuracy is a property of the trained model, so it lives in the Train card.
+  const accEl = document.getElementById("train-accuracy");
+  accEl.innerHTML = `Cross-validated accuracy: <b>${acc}</b>`;
+  accEl.hidden = false;
   document.getElementById("stats").innerHTML = `
-    <div class="metric"><span>Cross-validated accuracy</span><b>${acc}</b></div>
     <div class="metric"><span>Training points used</span><b>${data.n_points_used}${skipped}</b></div>
     <div class="metric"><span>Showing</span><b>${data.target_year} (trained on ${data.training_year})</b></div>`;
 
@@ -349,30 +605,140 @@ function renderResults(data) {
 }
 
 // ---------------------------------------------------------------------------
+// Compare (change detection between two years)
+// ---------------------------------------------------------------------------
+async function compare() {
+  if (!state.center) return status("Pick a study area first.", true);
+  if (state.classes.length < 2) return status("Define at least two classes.", true);
+  if (state.points.length < 2) return status("Add some training points first.", true);
+  if (state.compareA === state.compareB) return status("Pick two different years to compare.", true);
+
+  const payload = {
+    lat: state.center.lat,
+    lon: state.center.lon,
+    training_year: state.trainingYear,
+    year_a: state.compareA,
+    year_b: state.compareB,
+    classifier: state.classifier,
+    classes: state.classes,
+    points: state.points.map((p) => ({ class: p.cls, lat: p.lat, lon: p.lon })),
+  };
+
+  setBusy(true);
+  try {
+    const r = await fetch("/api/compare", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!r.ok) return status(await errorMessage(r), true);
+    const data = await r.json();
+    setOverlay(data.image, data.bounds); // clears the single-year legend
+    renderTransitions(data);
+    setActiveAction("compare");
+    persist();
+    hideStatus();
+  } catch (e) {
+    status("Network error contacting the server.", true);
+  } finally {
+    setBusy(false);
+  }
+}
+
+function renderTransitions(data) {
+  const trans = data.transitions || [];
+  // Percentages are of the total comparable area (changed + unchanged), so they
+  // read as "X% of the area went from → to" and sum to the total changed fraction.
+  const total = data.compared_pixels || 1;
+  const changed = trans.reduce((a, t) => a + t.pixels, 0);
+  const changedPct = ((changed / total) * 100).toFixed(1);
+
+  const note = document.getElementById("compare-note");
+  const acc = data.accuracy == null ? "—" : (data.accuracy * 100).toFixed(0) + "%";
+  note.textContent =
+    `Trained on ${data.training_year} · accuracy ${acc} · ` +
+    `${data.year_a} → ${data.year_b} · ${changedPct}% of area changed`;
+  note.hidden = false;
+
+  const ul = document.getElementById("transitions");
+  ul.innerHTML = "";
+  if (!trans.length) {
+    const li = document.createElement("li");
+    li.textContent = `No class changes between ${data.year_a} and ${data.year_b}.`;
+    ul.appendChild(li);
+    return;
+  }
+  // Scale bars to the largest transition so small (but real) changes stay visible.
+  const MAX_BAR_PX = 100;
+  const maxPixels = Math.max(...trans.map((t) => t.pixels));
+  trans.forEach((t) => {
+    const pct = ((t.pixels / total) * 100).toFixed(1);
+    const li = document.createElement("li");
+    const bar = document.createElement("span");
+    bar.className = "bar";
+    bar.style.background = t.color;
+    bar.style.width = Math.max(6, Math.round((t.pixels / maxPixels) * MAX_BAR_PX)) + "px";
+    const label = document.createElement("span");
+    label.textContent = `${t.from} → ${t.to}`; // textContent — injection-safe
+    const count = document.createElement("span");
+    count.className = "class-count";
+    count.textContent = pct + "%";
+    li.append(bar, label, count);
+    ul.appendChild(li);
+  });
+}
+
+// ---------------------------------------------------------------------------
 // UI helpers
 // ---------------------------------------------------------------------------
 function syncYearUI() {
-  document.getElementById("year-label").textContent = state.shownYear;
-  document.getElementById("year").value = state.shownYear;
+  document.getElementById("year-label").textContent = state.targetYear;
+  document.getElementById("year").value = state.targetYear;
   const note = document.getElementById("trained-note");
   note.textContent = state.trainedYear != null ? `trained on ${state.trainedYear}` : "";
+  const hint = document.getElementById("classify-hint");
+  hint.textContent = state.classifiedOnce
+    ? "Pick a year and click Classify to map it."
+    : "Train a model (step 4) first.";
+}
+
+// Keeps the Train card's controls (year dropdown + button) in sync with state.
+function syncTrainUI() {
+  document.getElementById("train-year").value = String(state.trainingYear);
+  updateTrainBtn();
 }
 
 function markDirty() {
-  if (state.classifiedOnce) { state.dirty = true; updateClassifyBtn(); }
+  if (state.classifiedOnce) { state.dirty = true; updateTrainBtn(); }
 }
 
-function updateClassifyBtn() {
-  const btn = document.getElementById("classify");
-  btn.textContent = state.classifiedOnce && state.dirty ? "Re-train & classify" : "Train & classify";
+function updateTrainBtn() {
+  const btn = document.getElementById("train");
+  btn.textContent = state.classifiedOnce && state.dirty ? "Re-train model" : "Train model";
   btn.classList.toggle("dirty", state.classifiedOnce && state.dirty);
+  btn.classList.toggle("trained", state.classifiedOnce); // persistent check once trained
 }
 
 function setBusy(busy) {
-  const btn = document.getElementById("classify");
-  btn.disabled = busy;
+  document.getElementById("train").disabled = busy;
+  document.getElementById("classify").disabled = busy;
   document.getElementById("year").disabled = busy;
+  document.getElementById("compare").disabled = busy;
   if (busy) status("Reading embeddings and classifying… the first look at a new area can take ~30 s.");
+}
+
+// Highlights the action whose result is currently on the map (Train / Classify /
+// Compare), so users can see what they're looking at. Pass null to clear.
+function setActiveAction(name) {
+  for (const id of ["train", "classify", "compare"]) {
+    document.getElementById(id).classList.toggle("active", id === name);
+  }
+}
+
+// Keeps the Compare card's year dropdowns in sync with state.
+function syncCompareUI() {
+  document.getElementById("compare-a").value = String(state.compareA);
+  document.getElementById("compare-b").value = String(state.compareB);
 }
 
 function status(msg, isError) {
@@ -412,7 +778,9 @@ function persist() {
 function snapshot() {
   return {
     center: state.center, classes: state.classes, points: state.points,
-    shownYear: state.shownYear, trainedYear: state.trainedYear,
+    trainingYear: state.trainingYear, targetYear: state.targetYear,
+    compareA: state.compareA, compareB: state.compareB,
+    trainedYear: state.trainedYear,
     classifier: state.classifier, opacity: state.opacity,
   };
 }
@@ -438,7 +806,11 @@ function applyProject(p) {
   state.center = p.center || null;
   state.classes = p.classes || [];
   state.points = p.points || [];
-  state.shownYear = p.shownYear || state.config.default_year;
+  // `shownYear` fallback keeps projects saved before the train/target split loading.
+  state.targetYear = p.targetYear ?? p.shownYear ?? state.config.default_year;
+  state.trainingYear = p.trainingYear ?? state.config.default_year;
+  state.compareA = p.compareA ?? state.config.min_year;
+  state.compareB = p.compareB ?? state.config.max_year;
   state.trainedYear = p.trainedYear ?? null;
   state.classifier = p.classifier || "rf";
   state.opacity = p.opacity ?? 0.7;
@@ -464,11 +836,14 @@ function importProject(e) {
     try {
       applyProject(JSON.parse(reader.result));
       clearOverlay();
+      document.getElementById("train-accuracy").hidden = true;
+      document.getElementById("classifier").value = state.classifier;
       renderClasses();
       renderPoints();
       if (state.center) goToArea(state.center.lat, state.center.lon, false);
+      syncTrainUI();
+      syncCompareUI();
       syncYearUI();
-      updateClassifyBtn();
       persist();
       status("Project loaded.");
     } catch (err) {

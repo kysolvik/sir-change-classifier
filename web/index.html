@@ -31,7 +31,8 @@
             <input id="lon" type="number" step="0.0001" placeholder="-122.4194" /></label>
         </div>
         <button id="go" class="btn">Go to area</button>
-        <p class="hint" id="area-hint">A <b id="box-km">10</b>&nbsp;km box will be placed around your point.</p>
+        <p class="hint" id="area-hint">A <b id="box-km">10</b>&nbsp;km box will be placed around your point. Right-click the map to move it.</p>
+        <p class="hint" id="imagery-date"></p>
       </section>
 
       <!-- 2. Classes -->
@@ -49,23 +50,33 @@
       <section class="card">
         <h2><span class="step">3</span> Add training points</h2>
         <p class="hint">Select a class above, then click the map to drop points on that
-          cover type. Aim for ~5 per class. Click a point to remove it.</p>
+          cover type. Aim for at least 5-10 per class. Click a point to remove it.</p>
         <div class="row">
           <button id="undo" class="btn small ghost">Undo last</button>
           <button id="clear-points" class="btn small ghost">Clear points</button>
         </div>
       </section>
 
-      <!-- 4. Classify -->
+      <!-- 4. Train the model -->
       <section class="card">
-        <h2><span class="step">4</span> Classify</h2>
+        <h2><span class="step">4</span> Train the model</h2>
         <label class="field"><span>Method</span>
           <select id="classifier">
             <option value="rf">Random forest</option>
             <option value="knn">K-nearest neighbours</option>
           </select>
         </label>
-        <button id="classify" class="btn primary">Train &amp; classify</button>
+        <label class="field"><span>Training year</span>
+          <select id="train-year"></select>
+        </label>
+        <p class="hint" id="train-year-hint"></p>
+        <button id="train" class="btn primary">Train model</button>
+        <p class="hint" id="train-accuracy" hidden></p>
+      </section>
+
+      <!-- 5. Classify -->
+      <section class="card">
+        <h2><span class="step">5</span> Classify</h2>
         <div class="year-block">
           <div class="year-head">
             <span>Year: <b id="year-label">2025</b></span>
@@ -73,10 +84,28 @@
           </div>
           <input id="year" type="range" min="2017" max="2025" step="1" value="2025" />
         </div>
+        <button id="classify" class="btn primary">Classify</button>
         <label class="field opacity">
           <span>Overlay opacity</span>
           <input id="opacity" type="range" min="0" max="100" step="5" value="70" />
         </label>
+        <p class="hint" id="classify-hint">Train a model (step 4) first.</p>
+      </section>
+
+      <!-- 6. Compare two years -->
+      <section class="card">
+        <h2><span class="step">6</span> Compare two years</h2>
+        <p class="hint">Apply your trained model to two years and colour every place the
+          class changed.</p>
+        <div class="latlon">
+          <label class="field"><span>Year A</span>
+            <select id="compare-a"></select></label>
+          <label class="field"><span>Year B</span>
+            <select id="compare-b"></select></label>
+        </div>
+        <button id="compare" class="btn primary">Compare</button>
+        <p class="hint" id="compare-note" hidden></p>
+        <ul id="transitions" class="legend"></ul>
       </section>
 
       <!-- Results -->
@@ -102,6 +131,7 @@
     <main id="map-wrap">
       <div id="map"></div>
       <div id="status" class="status" hidden></div>
+      <div id="coords" class="coords" hidden></div>
     </main>
   </div>
 
