@@ -1,0 +1,9 @@
+# Source uploaded by `gcloud run deploy --source` (keep it small: no venv/tests).
+.gcloudignore
+.git
+.gitignore
+.venv
+**/__pycache__
+*.pyc
+.pytest_cache
+tests/

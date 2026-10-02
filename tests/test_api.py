@@ -34,6 +34,8 @@ def client(monkeypatch):
     monkeypatch.setattr(main.cache, "_reader", fake_reader)
     monkeypatch.setattr(main.cache, "backend", InMemoryBackend())
     main.cache._inproc.clear()
+    main.limiter.reset()
+    main.classify_cap._stamps.clear()
     with TestClient(main.app) as c:
         yield c
 
@@ -104,6 +106,8 @@ def compare_client(monkeypatch):
     monkeypatch.setattr(main.cache, "_reader", fake_reader)
     monkeypatch.setattr(main.cache, "backend", InMemoryBackend())
     main.cache._inproc.clear()
+    main.limiter.reset()
+    main.classify_cap._stamps.clear()
     with TestClient(main.app) as c:
         yield c
 
@@ -140,3 +144,46 @@ def test_compare_rejects_unknown_class_point(compare_client):
     bad["points"].append({"class": "Z", "lat": 37.78, "lon": -122.44})
     r = compare_client.post("/api/compare", json=bad)
     assert r.status_code == 400
+
+
+# --- abuse / cost guards ---------------------------------------------------
+def _req(xff=None, host="10.0.0.1"):
+    headers = [(b"x-forwarded-for", xff.encode())] if xff is not None else []
+    return main.Request({"type": "http", "headers": headers, "client": (host, 1234)})
+
+
+def test_client_ip_trusts_rightmost_forwarded_entry():
+    # The left entries are client-supplied (spoofable); Cloud Run appends the real one.
+    assert main.client_ip(_req("6.6.6.6, 1.2.3.4")) == "1.2.3.4"
+    assert main.client_ip(_req("1.2.3.4")) == "1.2.3.4"
+
+
+def test_client_ip_falls_back_without_header():
+    assert main.client_ip(_req()) == "10.0.0.1"
+
+
+def test_global_cap_returns_503(client, monkeypatch):
+    monkeypatch.setattr(main.classify_cap, "per_hour", 2)
+    assert client.post("/api/classify", json=_payload()).status_code == 200
+    assert client.post("/api/classify", json=_payload()).status_code == 200
+    r = client.post("/api/classify", json=_payload())
+    assert r.status_code == 503
+    # Rotating IPs doesn't help: the cap is global.
+    r = client.post("/api/classify", json=_payload(), headers={"X-Forwarded-For": "9.9.9.9"})
+    assert r.status_code == 503
+
+
+def test_default_limit_covers_static_files_per_ip(client, monkeypatch):
+    monkeypatch.setattr(main, "_default_limit", main.parse_limit("3/minute"))
+    for _ in range(3):
+        assert client.get("/", headers={"X-Forwarded-For": "1.1.1.1"}).status_code == 200
+    assert client.get("/", headers={"X-Forwarded-For": "1.1.1.1"}).status_code == 429
+    # A different client is unaffected.
+    assert client.get("/", headers={"X-Forwarded-For": "2.2.2.2"}).status_code == 200
+
+
+def test_static_files_gzipped_and_cacheable(client):
+    r = client.get("/app.js", headers={"Accept-Encoding": "gzip"})
+    assert r.status_code == 200
+    assert r.headers["content-encoding"] == "gzip"
+    assert "max-age" in r.headers["cache-control"]

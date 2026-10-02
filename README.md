@@ -60,28 +60,27 @@ uv run pytest -m live         # extra test that reads the REAL source (network, 
 | `AEF_INDEX_DIR` | `/tmp/aef_index` | Where aef-loader stores its tile index. |
 | `COLD_FETCH_CONCURRENCY` | `4` | Max simultaneous cold reads from the source. |
 | `INPROC_CACHE_SIZE` | `6` | Hot windows kept in RAM per process (~64 MB each). |
-| `RATE_LIMIT` | `30/minute` | Per-IP limit on `/classify`. |
+| `RATE_LIMIT` | `60/minute` | Per-IP limit on `/classify` and `/compare` (a classroom behind one NAT shares an IP). |
+| `RATE_LIMIT_DEFAULT` | `300/minute` | Per-IP limit on every path, static files included. |
+| `GLOBAL_CLASSIFY_PER_HOUR` | `150` | Classify+compare calls per worker process per hour, all IPs combined; beyond it the API returns 503. |
 | `MAX_CLASSES` / `MAX_POINTS` | `12` / `500` | Request guard rails. |
 | `DEFAULT_CLASSIFIER` | `rf` | `rf` (random forest) or `knn`. |
+| `RF_N_ESTIMATORS` | `50` | Trees in the random forest; prediction time scales with it (~3.5 s per 10 km window on 2 vCPU). |
 | `WEB_CONCURRENCY` | `2` | gunicorn workers (Docker). |
 
 ## Deploy (Google Cloud Run)
 
 ```bash
-gcloud builds submit --tag REGION-docker.pkg.dev/PROJECT/REPO/classifier
-gcloud run deploy classifier \
-  --image REGION-docker.pkg.dev/PROJECT/REPO/classifier \
-  --memory 2Gi --cpu 2 --timeout 300 \
-  --set-env-vars GCS_CACHE_BUCKET=YOUR_BUCKET
-
-# optional: pre-fill the shared cache for the presets
-GCS_CACHE_BUCKET=YOUR_BUCKET uv run python -m scripts.warm_cache
+gcloud auth login && gcloud auth application-default login   # once
+PROJECT=solvik-montero-sir ./scripts/deploy.sh                 # first deploy & every update
+GCS_CACHE_BUCKET=solvik-montero-sir-aef-cache uv run python -m scripts.warm_cache   # once
 ```
 
-The Cloud Run service account needs read/write on the bucket. `/tmp` is a tmpfs
-on Cloud Run (counts against memory), so always set `GCS_CACHE_BUCKET` in
-production rather than relying on the disk fallback. Give it ≥ 2 GiB RAM (each
-cached 10 km window is ~64 MB).
+`scripts/deploy.sh` is idempotent. It enables the APIs, creates the GCS cache bucket and a
+service account that can only touch that bucket, then builds and deploys from source. On the
+first run it also sets up a billing budget and a request-flood alert. On redeploys, set
+`SKIP_ALERTS=1` to skip that part. You can override `REGION`, `SERVICE`, `MAX_INSTANCES`,
+`BUDGET_USD` and `ALERT_EMAIL`.
 
 ## Data & licensing
 

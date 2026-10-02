@@ -9,22 +9,69 @@ import asyncio
 import base64
 import contextlib
 import pathlib
+import time
+from collections import deque
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
-from slowapi.util import get_remote_address
+from limits import parse as parse_limit
 
 from . import classify, colorize, config, embeddings, geo
 from .cache import cache
 
 WEB_DIR = pathlib.Path(__file__).resolve().parent.parent / "web"
 
-limiter = Limiter(key_func=get_remote_address)
+
+
+def client_ip(request: Request) -> str:
+    """The real client IP for rate limiting.
+
+    Behind Cloud Run, ``request.client.host`` is the front end's address, so every
+    user would share one bucket. Cloud Run appends the caller's IP as the
+    *rightmost* X-Forwarded-For entry; anything left of it is client-supplied and
+    spoofable, so only the rightmost entry is trusted.
+    """
+    xff = request.headers.get("x-forwarded-for", "")
+    if xff.strip():
+        return xff.split(",")[-1].strip()
+    return request.client.host if request.client else "unknown"
+
+
+limiter = Limiter(key_func=client_ip)
+_default_limit = parse_limit(config.RATE_LIMIT_DEFAULT)
+
+
+class HourlyCap:
+    """Sliding one-hour window on expensive calls, shared by all IPs in-process."""
+
+    def __init__(self, per_hour: int):
+        self.per_hour = per_hour
+        self._stamps: deque[float] = deque()
+
+    def try_acquire(self) -> bool:
+        now = time.monotonic()
+        while self._stamps and now - self._stamps[0] > 3600:
+            self._stamps.popleft()
+        if len(self._stamps) >= self.per_hour:
+            return False
+        self._stamps.append(now)
+        return True
+
+
+classify_cap = HourlyCap(config.GLOBAL_CLASSIFY_PER_HOUR)
+
+
+def _require_capacity() -> None:
+    if not classify_cap.try_acquire():
+        raise HTTPException(
+            503, "The classifier is busy right now. Please try again in a few minutes."
+        )
 
 
 # --- request/response models ----------------------------------------------
@@ -117,6 +164,18 @@ def create_app() -> FastAPI:
     app = FastAPI(title="SIR Change Classifier", lifespan=lifespan)
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+    @app.middleware("http")
+    async def flood_guard(request: Request, call_next):
+        # slowapi's own middleware skips mounts, so the per-IP default limit for
+        # every path (static files included) is applied here.
+        if not limiter.limiter.hit(_default_limit, "default", client_ip(request)):
+            return JSONResponse({"error": "Too many requests"}, status_code=429)
+        response = await call_next(request)
+        if not request.url.path.startswith("/api/") and response.status_code == 200:
+            response.headers.setdefault("Cache-Control", "public, max-age=600")
+        return response
 
     @app.get("/healthz")
     async def healthz() -> dict:
@@ -143,6 +202,7 @@ def create_app() -> FastAPI:
     @limiter.limit(config.RATE_LIMIT)
     async def do_classify(request: Request, body: ClassifyRequest) -> JSONResponse:
         _require_known_point_classes(body)
+        _require_capacity()
 
         box = geo.build_box(body.lon, body.lat)
         try:
@@ -194,6 +254,7 @@ def create_app() -> FastAPI:
     @limiter.limit(config.RATE_LIMIT)
     async def do_compare(request: Request, body: CompareRequest) -> JSONResponse:
         _require_known_point_classes(body)
+        _require_capacity()
 
         box = geo.build_box(body.lon, body.lat)
         try:
