@@ -27,7 +27,15 @@ YEARS = list(range(MIN_YEAR, MAX_YEAR + 1))
 MAX_CLASSES = int(os.environ.get("MAX_CLASSES", "12"))
 MAX_POINTS = int(os.environ.get("MAX_POINTS", "500"))
 MIN_POINTS_TOTAL = 2  # need at least two labelled points across >=2 classes
-RATE_LIMIT = os.environ.get("RATE_LIMIT", "30/minute")
+# Per-IP limit on /classify and /compare. A whole classroom behind one school NAT
+# shares an IP, so this must cover ~20 students, not one.
+RATE_LIMIT = os.environ.get("RATE_LIMIT", "60/minute")
+# Per-IP limit on every path (static files included) — a cheap flood guard.
+RATE_LIMIT_DEFAULT = os.environ.get("RATE_LIMIT_DEFAULT", "300/minute")
+# Hard cap on classify+compare calls per worker process per hour, regardless of
+# IP. With Cloud Run max-instances this bounds total CPU spend even against a
+# botnet rotating IPs (total = cap x workers x max instances).
+GLOBAL_CLASSIFY_PER_HOUR = int(os.environ.get("GLOBAL_CLASSIFY_PER_HOUR", "150"))
 
 # --- Caching ---------------------------------------------------------------
 # Number of (box, year) embedding windows kept hot in process RAM. Each 10 km
@@ -46,7 +54,10 @@ AEF_INDEX_DIR = os.environ.get("AEF_INDEX_DIR", "/tmp/aef_index")
 
 # --- Classifier ------------------------------------------------------------
 DEFAULT_CLASSIFIER = os.environ.get("DEFAULT_CLASSIFIER", "rf")  # "rf" | "knn"
-RF_N_ESTIMATORS = int(os.environ.get("RF_N_ESTIMATORS", "150"))
+# Prediction cost scales with tree count: on 2 vCPU a full 10 km window takes
+# ~3.5 s at 50 trees vs ~9.6 s at 150. With a few dozen training points the
+# extra trees add little.
+RF_N_ESTIMATORS = int(os.environ.get("RF_N_ESTIMATORS", "50"))
 KNN_NEIGHBORS = int(os.environ.get("KNN_NEIGHBORS", "5"))
 NODATA = -128  # AlphaEarth int8 NoData sentinel
 
