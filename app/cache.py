@@ -1,4 +1,4 @@
-"""Two-tier cache for embedding windows.
+"""Two-tier cache for feature windows (AEF embeddings, Landsat composites, ...).
 
 Tier 1: a small per-process LRU (hot windows in RAM).
 Tier 2: a shared persistent store (a GCS bucket in production, or a local disk
@@ -18,7 +18,7 @@ from collections import OrderedDict
 
 import numpy as np
 
-from . import config, embeddings
+from . import config, embeddings, imagery
 from .embeddings import EmbeddingWindow
 from .geo import Box
 
@@ -91,11 +91,15 @@ def _build_backend():
 
 # --- the cache ------------------------------------------------------------
 class EmbeddingCache:
-    def __init__(self, backend=None, inproc_size: int | None = None, reader=None):
+    def __init__(self, backend=None, inproc_bytes: int | None = None, reader=None):
         self.backend = backend if backend is not None else _build_backend()
-        self.inproc_size = inproc_size if inproc_size is not None else config.INPROC_CACHE_SIZE
-        self._reader = reader or embeddings.read_window
+        self.inproc_bytes = (
+            inproc_bytes if inproc_bytes is not None else config.INPROC_CACHE_BYTES
+        )
+        self._reader = reader or embeddings.read_window          # AEF (default source)
+        self._landsat_reader = imagery.read_composite            # raw Landsat bands
         self._inproc: OrderedDict[str, EmbeddingWindow] = OrderedDict()
+        self._inproc_used = 0
         self._inflight: dict[str, asyncio.Future] = {}
         self.source_reads = 0  # cold reads that actually hit the source
 
@@ -106,13 +110,36 @@ class EmbeddingCache:
         return win
 
     def _hot_put(self, key: str, win: EmbeddingWindow) -> None:
+        old = self._inproc.pop(key, None)
+        if old is not None:
+            self._inproc_used -= old.array.nbytes
         self._inproc[key] = win
-        self._inproc.move_to_end(key)
-        while len(self._inproc) > self.inproc_size:
-            self._inproc.popitem(last=False)
+        self._inproc_used += win.array.nbytes
+        # Evict least-recently-used, but always keep the window just added.
+        while self._inproc_used > self.inproc_bytes and len(self._inproc) > 1:
+            _, evicted = self._inproc.popitem(last=False)
+            self._inproc_used -= evicted.array.nbytes
 
-    async def get_or_read(self, box: Box, year: int) -> EmbeddingWindow:
-        key = f"{box.key()}_{year}"
+    def clear_hot(self) -> None:
+        self._inproc.clear()
+        self._inproc_used = 0
+
+    def _readers(self) -> dict:
+        return {"aef": self._reader, "landsat": self._landsat_reader}
+
+    @staticmethod
+    def key(box: Box, year: int, source: str = "aef") -> str:
+        """Persistent cache key. AEF keeps its original (unprefixed) form so the
+        windows already warmed in production stay valid."""
+        if source == "aef":
+            return f"{box.key()}_{year}"
+        if source == "landsat":
+            tag = "h" if config.LANDSAT_HARMONIZE else ""
+            return f"landsat-{config.LANDSAT_CACHE_VERSION}{tag}_{box.key()}_{year}"
+        return f"{source}_{box.key()}_{year}"
+
+    async def get_or_read(self, box: Box, year: int, source: str = "aef") -> EmbeddingWindow:
+        key = self.key(box, year, source)
 
         hot = self._hot_get(key)
         if hot is not None:
@@ -126,7 +153,7 @@ class EmbeddingCache:
         fut: asyncio.Future = loop.create_future()
         self._inflight[key] = fut
         try:
-            win = await self._load(key, box, year)
+            win = await self._load(key, box, year, source)
             self._hot_put(key, win)
             fut.set_result(win)
             return win
@@ -136,13 +163,13 @@ class EmbeddingCache:
         finally:
             self._inflight.pop(key, None)
 
-    async def _load(self, key: str, box: Box, year: int) -> EmbeddingWindow:
+    async def _load(self, key: str, box: Box, year: int, source: str) -> EmbeddingWindow:
         data = await asyncio.to_thread(self.backend.get, key)
         if data is not None:
             return decode(data)
         # Cold: read from the source, then persist for everyone else.
         self.source_reads += 1
-        win = await self._reader(box, year)
+        win = await self._readers()[source](box, year)
         try:
             await asyncio.to_thread(self.backend.put, key, encode(win))
         except Exception:

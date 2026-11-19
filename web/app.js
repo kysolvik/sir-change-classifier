@@ -8,6 +8,7 @@ const PALETTE = [
   "#a6cee3", "#b2df8a", "#fb9a99", "#fdbf6f", "#cab2d6", "#ffff99",
 ];
 const STORAGE_KEY = "sir-classifier-state";
+const UI_KEY = "sir-classifier-ui"; // which steps are open (per browser, not exported)
 
 const state = {
   config: null,
@@ -21,12 +22,19 @@ const state = {
   compareB: 2025,        // Compare card: second year
   trainedYear: null,
   classifier: "rf",
+  featureSource: "aef",  // id from config.feature_sources ("aef" | "landsat")
+  imageryStyle: "",      // "" = Esri basemap, else a Landsat style id (step 3)
+  imageryYear: 2025,     // year of the Landsat background imagery
   opacity: 0.7,
   dirty: false,
   classifiedOnce: false,
 };
 
-let map, boxLayer, overlayLayer, boxBounds;
+let map, boxLayer, overlayLayer, imageryLayer, boxBounds;
+let currentAction = null; // "train" | "classify" | "compare" — what the map shows
+// Collapsible steps: `open` = expanded step numbers; `reached` = furthest step the
+// guided flow has opened (auto-advance only happens the first time through).
+const ui = { open: new Set([1]), reached: 1, didClassify: false, didCompare: false };
 const markers = L.layerGroup();
 
 // ---------------------------------------------------------------------------
@@ -38,10 +46,12 @@ async function init() {
   setupMap();
   await loadConfig();
   restore();
+  setupSteps();
   wireControls();
   renderClasses();
   renderPoints();
   if (state.center) goToArea(state.center.lat, state.center.lon, false);
+  syncFeatureUI();
   syncTrainUI();
   syncCompareUI();
   syncYearUI();
@@ -62,6 +72,8 @@ function setupMap() {
     { maxZoom: 19, opacity: 0.9 }
   ).addTo(map);
 
+  map.createPane("imageryPane");
+  map.getPane("imageryPane").style.zIndex = 250; // Landsat: above the basemap tiles
   map.createPane("classPane");
   map.getPane("classPane").style.zIndex = 350; // below markers, above imagery
   markers.addTo(map);
@@ -96,31 +108,28 @@ async function loadConfig() {
   state.trainingYear = c.default_year;
   state.classifier = c.default_classifier || "rf";
   document.getElementById("box-km").textContent = c.box_size_km;
-  const yr = document.getElementById("year");
-  yr.min = c.min_year;
-  yr.max = c.max_year;
-  yr.value = c.default_year;
-  const trainYr = document.getElementById("train-year");
-  for (let y = c.min_year; y <= c.max_year; y++) {
-    const opt = document.createElement("option");
-    opt.value = String(y);
-    opt.textContent = String(y);
-    trainYr.appendChild(opt);
-  }
-  trainYr.value = String(c.default_year);
-  // Compare card: two year dropdowns spanning the full range (earliest → latest).
+  state.featureSource = c.default_feature_source || "aef";
+  // Compare card: default to the full AEF range (earliest → latest).
   state.compareA = c.min_year;
   state.compareB = c.max_year;
-  for (const [id, val] of [["compare-a", c.min_year], ["compare-b", c.max_year]]) {
-    const sel = document.getElementById(id);
-    for (let y = c.min_year; y <= c.max_year; y++) {
-      const opt = document.createElement("option");
-      opt.value = String(y);
-      opt.textContent = String(y);
-      sel.appendChild(opt);
-    }
-    sel.value = String(val);
-  }
+  state.imageryYear = c.default_year;
+
+  const featSel = document.getElementById("feature-source");
+  c.feature_sources.forEach((f) => {
+    const opt = document.createElement("option");
+    opt.value = f.id;
+    opt.textContent = `${f.label} (${f.min_year}–${f.max_year}, ${f.res_m} m)`;
+    featSel.appendChild(opt);
+  });
+  const styleSel = document.getElementById("imagery-style");
+  (c.imagery_styles || []).forEach((st) => {
+    const opt = document.createElement("option");
+    opt.value = st.id;
+    opt.textContent = `Landsat — ${st.label}`;
+    styleSel.appendChild(opt);
+  });
+  const lsat = imagerySource();
+  if (lsat) fillYearSelect(document.getElementById("imagery-year"), lsat.min_year, lsat.max_year);
   const presetSel = document.getElementById("preset");
   c.presets.forEach((p) => {
     const opt = document.createElement("option");
@@ -167,11 +176,44 @@ function wireControls() {
   document.getElementById("classifier").addEventListener("change", (e) => {
     state.classifier = e.target.value; markDirty(); persist();
   });
+  document.getElementById("feature-source").addEventListener("change", (e) => {
+    state.featureSource = e.target.value;
+    markDirty();
+    syncFeatureUI(); // re-ranges every year control for the new source
+    syncTrainUI();
+    syncCompareUI();
+    syncYearUI();
+    persist();
+  });
   document.getElementById("train-year").addEventListener("change", (e) => {
     state.trainingYear = +e.target.value;
     state.targetYear = state.trainingYear; // classify year matches the train year by default
-    markDirty(); syncYearUI(); persist();
+    markDirty(); syncYearUI(); syncImageryUI(); persist();
   });
+  document.getElementById("evaluate").addEventListener("click", evaluateFeatures);
+
+  document.getElementById("imagery-style").addEventListener("change", (e) => {
+    const turningOn = !state.imageryStyle && e.target.value;
+    state.imageryStyle = e.target.value;
+    // Start on the year the map is showing (Compare's first year, or the classified year).
+    if (turningOn) state.imageryYear = clampToSource(mapYear(), imagerySource());
+    showImagery();
+    persist();
+  });
+  document.getElementById("imagery-year").addEventListener("change", (e) => {
+    state.imageryYear = +e.target.value; showImagery(); persist();
+  });
+  document.getElementById("imagery-prev").addEventListener("click", () => stepImageryYear(-1));
+  document.getElementById("imagery-next").addEventListener("click", () => stepImageryYear(1));
+  document.querySelectorAll("#imagery-jumps [data-jump]").forEach((btn) =>
+    btn.addEventListener("click", () => {
+      const src = imagerySource();
+      const year = { a: state.compareA, b: state.compareB }[btn.dataset.jump];
+      state.imageryYear = clampToSource(year, src);
+      showImagery();
+      persist();
+    })
+  );
   document.getElementById("train").addEventListener("click", () => classify(true));
   document.getElementById("classify").addEventListener("click", () => {
     if (!state.classifiedOnce) return status("Train a model first (step 4).", true);
@@ -182,17 +224,21 @@ function wireControls() {
   yr.addEventListener("input", (e) => { state.targetYear = +e.target.value; syncYearUI(); });
   yr.addEventListener("change", () => persist());
 
-  document.getElementById("opacity").addEventListener("input", (e) => {
-    state.opacity = e.target.value / 100;
-    if (overlayLayer) overlayLayer.setOpacity(state.opacity);
-    persist();
-  });
+  // Two sliders (steps 5 and 7) drive the same overlay opacity.
+  document.querySelectorAll(".opacity-input").forEach((el) =>
+    el.addEventListener("input", (e) => {
+      state.opacity = e.target.value / 100;
+      if (overlayLayer) overlayLayer.setOpacity(state.opacity);
+      document.querySelectorAll(".opacity-input").forEach((o) => { o.value = e.target.value; });
+      persist();
+    })
+  );
 
   document.getElementById("compare-a").addEventListener("change", (e) => {
-    state.compareA = +e.target.value; persist();
+    state.compareA = +e.target.value; syncImageryUI(); persist();
   });
   document.getElementById("compare-b").addEventListener("change", (e) => {
-    state.compareB = +e.target.value; persist();
+    state.compareB = +e.target.value; syncImageryUI(); persist();
   });
   document.getElementById("compare").addEventListener("click", compare);
 
@@ -236,13 +282,201 @@ function goToArea(lat, lon, newArea) {
     state.trainingYear = state.config.default_year;
     state.targetYear = state.config.default_year;
     document.getElementById("train-accuracy").hidden = true;
+    document.getElementById("feature-compare").hidden = true;
+    ui.didClassify = ui.didCompare = false;
     renderClasses(); // per-class counts back to 0
     renderPoints();  // clear the markers
     syncTrainUI();   // resets the Train button + year dropdown
     syncYearUI();
   }
+  syncFeatureUI(); // preset-only sources are enabled just on the example places
+  syncTrainUI();
+  syncCompareUI();
+  syncYearUI();
+  showImagery();   // reload (or drop) the Landsat background for the new area
   fetchImageryDate(lat, lon, newArea);
   persist();
+  if (newArea) advanceFrom(1);
+}
+
+function currentAreaIsPreset() {
+  if (!state.center || !state.config) return false;
+  return (state.config.presets || []).some(
+    (p) => Math.abs(p.lat - state.center.lat) < 1e-3 && Math.abs(p.lon - state.center.lon) < 1e-3
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Feature sources (AEF embeddings, Landsat bands, …) and their year ranges
+// ---------------------------------------------------------------------------
+function sourceById(id) {
+  return (state.config.feature_sources || []).find((f) => f.id === id) || null;
+}
+function currentSource() {
+  return sourceById(state.featureSource) || state.config.feature_sources[0];
+}
+// The source whose raw imagery step 3 can show (Landsat).
+function imagerySource() {
+  return (state.config.feature_sources || []).find((f) => f.imagery) || null;
+}
+function sourceAllowedHere(src) {
+  return !!src && (!src.preset_only || currentAreaIsPreset());
+}
+function clampToSource(year, src) {
+  return Math.min(src.max_year, Math.max(src.min_year, year));
+}
+
+function fillYearSelect(sel, min, max) {
+  const keep = sel.value;
+  sel.innerHTML = "";
+  for (let y = min; y <= max; y++) {
+    const opt = document.createElement("option");
+    opt.value = String(y);
+    opt.textContent = String(y);
+    sel.appendChild(opt);
+  }
+  if (keep) sel.value = keep;
+}
+
+// Slow sources (Landsat) are pre-warmed for the example places only, so they are
+// enabled just there. Also re-ranges every year control to the chosen source.
+function syncFeatureUI() {
+  const sel = document.getElementById("feature-source");
+  const note = document.getElementById("feature-note");
+  for (const f of state.config.feature_sources) {
+    sel.querySelector(`option[value="${f.id}"]`).disabled = !sourceAllowedHere(f);
+  }
+  if (!sourceAllowedHere(currentSource())) state.featureSource = state.config.default_feature_source;
+  sel.value = state.featureSource;
+
+  const src = currentSource();
+  const blocked = state.config.feature_sources.filter((f) => !sourceAllowedHere(f));
+  note.textContent = blocked.length
+    ? `${blocked.map((f) => f.label).join(", ")}: example places only, for now.`
+    : src.id === "aef"
+      ? "AlphaEarth embeddings summarise a whole year of many satellites, 2017 onward."
+      : `${src.label}: the raw ${src.res_m} m reflectance, back to ${src.min_year}.`;
+
+  // A model belongs to one source + year; drop it if that year no longer exists.
+  if (state.trainedYear != null && (state.trainedYear < src.min_year || state.trainedYear > src.max_year)) {
+    state.trainedYear = null;
+    state.classifiedOnce = false;
+    state.dirty = false;
+    updateTrainBtn();
+  }
+  state.trainingYear = clampToSource(state.trainingYear, src);
+  state.targetYear = clampToSource(state.targetYear, src);
+  state.compareA = clampToSource(state.compareA, src);
+  state.compareB = clampToSource(state.compareB, src);
+  fillYearSelect(document.getElementById("train-year"), src.min_year, src.max_year);
+  fillYearSelect(document.getElementById("compare-a"), src.min_year, src.max_year);
+  fillYearSelect(document.getElementById("compare-b"), src.min_year, src.max_year);
+  const yr = document.getElementById("year");
+  yr.min = src.min_year;
+  yr.max = src.max_year;
+}
+
+// ---------------------------------------------------------------------------
+// Satellite imagery: Landsat composites over the Esri basemap (step 7)
+// ---------------------------------------------------------------------------
+let imageryReq = 0;
+const imageryMemo = new Map(); // "lat,lon,year,style" -> response (instant re-flips)
+const IMAGERY_MEMO_MAX = 80;
+
+// The year the classification overlay is showing (for Compare: its first year).
+function mapYear() {
+  if (currentAction === "compare") return state.compareA;
+  if (currentAction) return state.targetYear;
+  return state.trainingYear;
+}
+
+function stepImageryYear(delta) {
+  const src = imagerySource();
+  if (!src) return;
+  const next = clampToSource(state.imageryYear + delta, src);
+  if (next === state.imageryYear) return;
+  state.imageryYear = next;
+  showImagery();
+  persist();
+}
+
+function clearImagery() {
+  if (imageryLayer) { map.removeLayer(imageryLayer); imageryLayer = null; }
+}
+
+function syncImageryUI(noteText, warn) {
+  const src = imagerySource();
+  const styleSel = document.getElementById("imagery-style");
+  const allowed = sourceAllowedHere(src) && !!state.center;
+  for (const opt of styleSel.options) if (opt.value) opt.disabled = !allowed;
+  if (!allowed) state.imageryStyle = "";
+  styleSel.value = state.imageryStyle;
+  document.getElementById("imagery-year-row").hidden = !state.imageryStyle;
+  const jumps = document.getElementById("imagery-jumps");
+  jumps.hidden = !state.imageryStyle;
+  const labels = { a: `Year A · ${state.compareA}`, b: `Year B · ${state.compareB}` };
+  const years = { a: state.compareA, b: state.compareB };
+  jumps.querySelectorAll("[data-jump]").forEach((btn) => {
+    btn.textContent = labels[btn.dataset.jump];
+    btn.classList.toggle("current", years[btn.dataset.jump] === state.imageryYear);
+  });
+  document.getElementById("imagery-year").value = String(state.imageryYear);
+  if (src) {
+    document.getElementById("imagery-prev").disabled = state.imageryYear <= src.min_year;
+    document.getElementById("imagery-next").disabled = state.imageryYear >= src.max_year;
+  }
+  const note = document.getElementById("imagery-note");
+  if (noteText == null) {
+    noteText = !src ? ""
+      : !state.center ? ""
+      : !allowed ? "Landsat imagery is available for the example places only, for now."
+      : !state.imageryStyle ? `Switch to Landsat to see this place any year from ${src.min_year} to ${src.max_year}.`
+      : "";
+  }
+  note.textContent = noteText;
+  note.classList.toggle("warn", !!warn);
+}
+
+async function showImagery() {
+  const src = imagerySource();
+  syncImageryUI(); // also turns the style off when not allowed here
+  if (!state.imageryStyle || !state.center || !src) { clearImagery(); return; }
+
+  const { lat, lon } = state.center;
+  const year = state.imageryYear;
+  const style = state.imageryStyle;
+  const key = `${lat},${lon},${year},${style}`;
+  const reqId = ++imageryReq;
+  let data = imageryMemo.get(key);
+  if (!data) {
+    syncImageryUI(`Loading Landsat ${year}… a year nobody has looked at yet can take ~20 s.`);
+    try {
+      const qs = new URLSearchParams({ lat, lon, year, style, source: src.id });
+      const r = await fetch("/api/imagery?" + qs);
+      if (reqId !== imageryReq) return; // the user has moved on to another year/area
+      if (!r.ok) {
+        clearImagery();
+        return syncImageryUI(`No Landsat picture for ${year}: ${await errorMessage(r)}`, true);
+      }
+      data = await r.json();
+    } catch (e) {
+      if (reqId === imageryReq) syncImageryUI("Network error loading Landsat imagery.", true);
+      return;
+    }
+    if (reqId !== imageryReq) return;
+    imageryMemo.set(key, data);
+    if (imageryMemo.size > IMAGERY_MEMO_MAX) imageryMemo.delete(imageryMemo.keys().next().value);
+  }
+  clearImagery();
+  imageryLayer = L.imageOverlay(data.image, data.bounds, {
+    pane: "imageryPane", className: "pixelated", interactive: false,
+  }).addTo(map);
+  if (boxLayer) boxLayer.setBounds(data.bounds); // the server's snapped box
+
+  const gaps = data.coverage < 0.995
+    ? ` · ${((1 - data.coverage) * 100).toFixed(0)}% gaps (always cloudy or no data)`
+    : "";
+  syncImageryUI(`Landsat ${year} · ${data.res_m} m pixels${gaps}`);
 }
 
 function kmBox(lat, lon, km) {
@@ -324,12 +558,13 @@ async function fetchImageryDate(lat, lon, seed) {
     // Suggest labelling on the year you actually see, and seed it on a new area.
     const hint = document.getElementById("train-year-hint");
     if (year) {
-      const clamped = Math.min(state.config.max_year, Math.max(state.config.min_year, +year));
+      const clamped = clampToSource(+year, currentSource());
       hint.textContent = `Tip: match the satellite imagery (here: ${year}) you're labelling.`;
       if (seed) {
         state.trainingYear = clamped;
         state.targetYear = clamped; // classify year matches the train year by default
         syncTrainUI();
+        syncImageryUI();
         syncYearUI();
         markDirty(); // a re-train is needed if a model already existed
         persist();
@@ -531,6 +766,7 @@ async function classify(train) {
     training_year: trainingYear,
     target_year: state.targetYear,
     classifier: state.classifier,
+    feature_source: state.featureSource,
     classes: state.classes,
     points: state.points.map((p) => ({ class: p.cls, lat: p.lat, lon: p.lon })),
   };
@@ -551,8 +787,10 @@ async function classify(train) {
     state.dirty = false;
     updateTrainBtn();
     syncYearUI();
+    if (!train) ui.didClassify = true;
     persist();
     hideStatus();
+    advanceFrom(train ? 4 : 5);
   } catch (e) {
     status("Network error contacting the server.", true);
   } finally {
@@ -590,6 +828,7 @@ function renderResults(data) {
   accEl.hidden = false;
   document.getElementById("stats").innerHTML = `
     <div class="metric"><span>Training points used</span><b>${data.n_points_used}${skipped}</b></div>
+    <div class="metric"><span>Features</span><b>${escapeHtml(sourceById(data.feature_source)?.label || data.feature_source)}</b></div>
     <div class="metric"><span>Showing</span><b>${data.target_year} (trained on ${data.training_year})</b></div>`;
 
   const legend = document.getElementById("legend");
@@ -620,6 +859,7 @@ async function compare() {
     year_a: state.compareA,
     year_b: state.compareB,
     classifier: state.classifier,
+    feature_source: state.featureSource,
     classes: state.classes,
     points: state.points.map((p) => ({ class: p.cls, lat: p.lat, lon: p.lon })),
   };
@@ -636,8 +876,10 @@ async function compare() {
     setOverlay(data.image, data.bounds); // clears the single-year legend
     renderTransitions(data);
     setActiveAction("compare");
+    ui.didCompare = true;
     persist();
     hideStatus();
+    advanceFrom(6);
   } catch (e) {
     status("Network error contacting the server.", true);
   } finally {
@@ -689,6 +931,100 @@ function renderTransitions(data) {
 }
 
 // ---------------------------------------------------------------------------
+// Compare feature types (accuracy of each source on the same points)
+// ---------------------------------------------------------------------------
+async function evaluateFeatures() {
+  if (!state.center) return status("Pick a study area first.", true);
+  if (state.classes.length < 2) return status("Define at least two classes.", true);
+  if (state.points.length < 2) return status("Add some training points first.", true);
+
+  const payload = {
+    lat: state.center.lat,
+    lon: state.center.lon,
+    training_year: state.trainingYear,
+    classifier: state.classifier,
+    classes: state.classes,
+    points: state.points.map((p) => ({ class: p.cls, lat: p.lat, lon: p.lon })),
+  };
+  setBusy(true);
+  status("Scoring your points with each feature type…");
+  try {
+    const r = await fetch("/api/evaluate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!r.ok) return status(await errorMessage(r), true);
+    renderFeatureCompare(await r.json());
+    hideStatus();
+  } catch (e) {
+    status("Network error contacting the server.", true);
+  } finally {
+    setBusy(false);
+  }
+}
+
+function renderFeatureCompare(data) {
+  const box = document.getElementById("feature-compare");
+  box.innerHTML = "";
+  box.hidden = false;
+  const pct = (a) => (a == null ? "—" : (a * 100).toFixed(0) + "%");
+  const results = data.results;
+
+  // One row per class, plus "All points"; one column per feature source. The
+  // best score in each row is highlighted (ties all highlighted).
+  const rows = [{ name: "All points", get: (r) => r.accuracy, overall: true }].concat(
+    state.classes
+      .filter((c) => results.some((r) => r.per_class[c.name] != null))
+      .map((c) => ({ name: c.name, get: (r) => r.per_class[c.name] }))
+  );
+  const table = document.createElement("table");
+  const head = table.createTHead().insertRow();
+  head.appendChild(document.createElement("th")).textContent = `Accuracy, ${data.training_year}`;
+  results.forEach((r) => {
+    const th = document.createElement("th");
+    th.textContent = r.label.replace(/ (embeddings|bands)$/, "");
+    th.title = `${r.label} (${r.res_m} m pixels)`;
+    head.appendChild(th);
+  });
+  const body = table.createTBody();
+  rows.forEach((row) => {
+    const tr = body.insertRow();
+    if (row.overall) tr.className = "overall";
+    tr.insertCell().textContent = row.name;
+    const vals = results.map(row.get);
+    const best = Math.max(...vals.filter((v) => v != null));
+    vals.forEach((v) => {
+      const td = tr.insertCell();
+      td.textContent = pct(v);
+      if (results.length > 1 && v != null && v === best) td.className = "best";
+    });
+  });
+  box.appendChild(table);
+
+  const note = document.createElement("p");
+  note.className = "hint";
+  const dropped = data.n_points_total - data.n_points_shared;
+  note.textContent =
+    `Each point is hidden from the model in turn and predicted (cross-validation), ` +
+    `using the same ${data.n_points_shared} points for every feature type` +
+    (dropped ? ` (${dropped} skipped: outside the box or on a gap in one of them).` : ".");
+  box.appendChild(note);
+  if (results.some((r) => r.accuracy == null)) {
+    const p = document.createElement("p");
+    p.className = "hint";
+    p.textContent = "Add at least 2 points to every class to get an accuracy.";
+    box.appendChild(p);
+  }
+  (data.skipped || []).forEach((s) => {
+    const p = document.createElement("p");
+    p.className = "hint warn";
+    p.textContent = `${s.label}: not compared — ${s.reason}`;
+    box.appendChild(p);
+  });
+}
+
+// ---------------------------------------------------------------------------
 // UI helpers
 // ---------------------------------------------------------------------------
 function syncYearUI() {
@@ -709,6 +1045,7 @@ function syncTrainUI() {
 }
 
 function markDirty() {
+  document.getElementById("feature-compare").hidden = true; // scores are now stale
   if (state.classifiedOnce) { state.dirty = true; updateTrainBtn(); }
 }
 
@@ -724,12 +1061,18 @@ function setBusy(busy) {
   document.getElementById("classify").disabled = busy;
   document.getElementById("year").disabled = busy;
   document.getElementById("compare").disabled = busy;
-  if (busy) status("Reading embeddings and classifying… the first look at a new area can take ~30 s.");
+  document.getElementById("evaluate").disabled = busy;
+  if (busy) {
+    status(state.featureSource === "landsat"
+      ? "Reading Landsat composites and classifying… a year nobody has used yet can take ~20 s."
+      : "Reading embeddings and classifying… the first look at a new area can take ~30 s.");
+  }
 }
 
 // Highlights the action whose result is currently on the map (Train / Classify /
 // Compare), so users can see what they're looking at. Pass null to clear.
 function setActiveAction(name) {
+  currentAction = name;
   for (const id of ["train", "classify", "compare"]) {
     document.getElementById(id).classList.toggle("active", id === name);
   }
@@ -773,6 +1116,112 @@ function persist() {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot()));
   } catch (e) {}
+  syncStepDone();
+}
+
+// ---------------------------------------------------------------------------
+// Collapsible steps
+// ---------------------------------------------------------------------------
+const NEXT_BUTTON_STEPS = [2, 3, 5, 6]; // steps without a natural "done" action
+
+function stepCards() {
+  return [...document.querySelectorAll(".step-card")];
+}
+
+// Wraps each step's content in a collapsible body, makes its heading the toggle,
+// and adds "Next step" buttons. Runs once at boot.
+function setupSteps() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(UI_KEY));
+    if (saved && Array.isArray(saved.open)) {
+      ui.open = new Set(saved.open);
+      ui.reached = saved.reached || 1;
+    }
+  } catch (e) {}
+
+  stepCards().forEach((card) => {
+    const n = +card.dataset.step;
+    const h2 = card.querySelector("h2");
+    const num = h2.querySelector(".step");
+    num.innerHTML = `<span class="num">${num.textContent}</span>`;
+    const chev = document.createElement("span");
+    chev.className = "chev";
+    chev.textContent = "▼";
+    chev.setAttribute("aria-hidden", "true");
+    h2.appendChild(chev);
+    h2.tabIndex = 0;
+    h2.setAttribute("role", "button");
+
+    const body = document.createElement("div");
+    body.className = "step-body";
+    [...card.children].filter((el) => el !== h2).forEach((el) => body.appendChild(el));
+    card.appendChild(body);
+
+    if (NEXT_BUTTON_STEPS.includes(n)) {
+      const next = document.createElement("button");
+      next.type = "button";
+      next.className = "btn small ghost step-next";
+      next.textContent = "Next step ▸";
+      next.addEventListener("click", () => goToStep(n + 1, n));
+      body.appendChild(next);
+    }
+
+    const toggle = () => setStepOpen(n, !ui.open.has(n));
+    h2.addEventListener("click", toggle);
+    h2.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(); }
+    });
+  });
+  renderSteps();
+}
+
+function setStepOpen(n, open) {
+  if (open) ui.open.add(n); else ui.open.delete(n);
+  renderSteps();
+}
+
+// Collapse `from`, open `n`, and bring it into view.
+function goToStep(n, from) {
+  if (!stepCards().some((c) => +c.dataset.step === n)) return;
+  if (from != null) ui.open.delete(from);
+  ui.open.add(n);
+  ui.reached = Math.max(ui.reached, n);
+  renderSteps();
+  const card = document.querySelector(`.step-card[data-step="${n}"]`);
+  card.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+// Called when step `n` is completed: moves on only the first time through, so
+// re-running a step later (e.g. classifying another year) doesn't jump around.
+function advanceFrom(n) {
+  if (ui.reached <= n) goToStep(n + 1, n);
+}
+
+function renderSteps() {
+  stepCards().forEach((card) => {
+    const open = ui.open.has(+card.dataset.step);
+    card.classList.toggle("collapsed", !open);
+    card.querySelector("h2").setAttribute("aria-expanded", String(open));
+  });
+  try {
+    localStorage.setItem(UI_KEY, JSON.stringify({ open: [...ui.open], reached: ui.reached }));
+  } catch (e) {}
+}
+
+// A green check on each step whose job is done.
+function syncStepDone() {
+  const byClass = {};
+  state.points.forEach((p) => (byClass[p.cls] = (byClass[p.cls] || 0) + 1));
+  const done = {
+    1: !!state.center,
+    2: state.classes.length >= 2,
+    3: state.points.length >= 2 && Object.keys(byClass).length >= 2,
+    4: state.classifiedOnce,
+    5: ui.didClassify,
+    6: ui.didCompare,
+    7: !!state.imageryStyle,
+  };
+  stepCards().forEach((card) => card.classList.toggle("done", !!done[+card.dataset.step]));
 }
 
 function snapshot() {
@@ -781,7 +1230,9 @@ function snapshot() {
     trainingYear: state.trainingYear, targetYear: state.targetYear,
     compareA: state.compareA, compareB: state.compareB,
     trainedYear: state.trainedYear,
-    classifier: state.classifier, opacity: state.opacity,
+    classifier: state.classifier, featureSource: state.featureSource,
+    imageryStyle: state.imageryStyle, imageryYear: state.imageryYear,
+    opacity: state.opacity,
   };
 }
 
@@ -799,7 +1250,7 @@ function restore() {
     ];
   }
   document.getElementById("classifier").value = state.classifier;
-  document.getElementById("opacity").value = Math.round(state.opacity * 100);
+  document.querySelectorAll(".opacity-input").forEach((o) => { o.value = Math.round(state.opacity * 100); });
 }
 
 function applyProject(p) {
@@ -813,6 +1264,9 @@ function applyProject(p) {
   state.compareB = p.compareB ?? state.config.max_year;
   state.trainedYear = p.trainedYear ?? null;
   state.classifier = p.classifier || "rf";
+  state.featureSource = sourceById(p.featureSource) ? p.featureSource : state.config.default_feature_source;
+  state.imageryStyle = p.imageryStyle || "";
+  state.imageryYear = p.imageryYear ?? state.config.default_year;
   state.opacity = p.opacity ?? 0.7;
   state.selected = 0;
   state.classifiedOnce = false;
@@ -837,10 +1291,13 @@ function importProject(e) {
       applyProject(JSON.parse(reader.result));
       clearOverlay();
       document.getElementById("train-accuracy").hidden = true;
+      document.getElementById("feature-compare").hidden = true;
       document.getElementById("classifier").value = state.classifier;
       renderClasses();
       renderPoints();
       if (state.center) goToArea(state.center.lat, state.center.lon, false);
+      else showImagery();
+      syncFeatureUI();
       syncTrainUI();
       syncCompareUI();
       syncYearUI();
