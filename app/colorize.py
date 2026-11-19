@@ -70,3 +70,45 @@ def ids_to_png(ids: np.ndarray, color_by_id: dict[int, str]) -> bytes:
     buf = io.BytesIO()
     Image.fromarray(rgba, mode="RGBA").save(buf, format="PNG", optimize=True)
     return buf.getvalue()
+
+
+# --- raw imagery (Landsat composites) ---------------------------------------
+# Band combinations students can view. A *fixed* reflectance stretch (not a
+# per-image percentile one) keeps every year on the same scale, so a change in
+# brightness between years is a real change on the ground.
+IMAGERY_STYLES: dict[str, dict] = {
+    "natural": {
+        "label": "Natural colour",
+        "bands": ("red", "green", "blue"),
+        "max": 0.30,
+    },
+    "false": {
+        "label": "False colour (plants are red)",
+        "bands": ("nir08", "red", "green"),
+        "max": 0.50,
+    },
+    "swir": {
+        "label": "Shortwave infrared (bare ground & cities stand out)",
+        "bands": ("swir22", "nir08", "red"),
+        "max": 0.50,
+    },
+}
+IMAGERY_GAMMA = 1.6  # brightens dark land without blowing out bright desert/ice
+
+
+def bands_to_png(array: np.ndarray, band_names: list[str], style: str) -> bytes:
+    """Render a float reflectance ``(H, W, bands)`` window as an RGBA PNG.
+
+    NaN (cloud gaps / no data) pixels are transparent so the basemap shows through.
+    """
+    spec = IMAGERY_STYLES[style]
+    rgb = np.stack([array[..., band_names.index(b)] for b in spec["bands"]], axis=-1)
+    valid = np.all(np.isfinite(rgb), axis=-1)
+    scaled = np.clip(np.nan_to_num(rgb) / spec["max"], 0, 1) ** (1 / IMAGERY_GAMMA)
+    rgba = np.zeros(rgb.shape[:2] + (4,), dtype=np.uint8)
+    rgba[..., :3] = (scaled * 255).round().astype(np.uint8)
+    rgba[..., 3] = np.where(valid, 255, 0)
+
+    buf = io.BytesIO()
+    Image.fromarray(rgba, mode="RGBA").save(buf, format="PNG", optimize=True)
+    return buf.getvalue()

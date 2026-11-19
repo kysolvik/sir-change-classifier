@@ -18,7 +18,7 @@
       </header>
 
       <!-- 1. Study area -->
-      <section class="card">
+      <section class="card step-card" data-step="1">
         <h2><span class="step">1</span> Pick a study area</h2>
         <label class="field">
           <span>Example places</span>
@@ -36,7 +36,7 @@
       </section>
 
       <!-- 2. Classes -->
-      <section class="card">
+      <section class="card step-card" data-step="2">
         <h2><span class="step">2</span> Define classes</h2>
         <ul id="class-list" class="class-list"></ul>
         <div class="add-class">
@@ -47,7 +47,7 @@
       </section>
 
       <!-- 3. Points -->
-      <section class="card">
+      <section class="card step-card" data-step="3">
         <h2><span class="step">3</span> Add training points</h2>
         <p class="hint">Select a class above, then click the map to drop points on that
           cover type. Aim for at least 5-10 per class. Click a point to remove it.</p>
@@ -55,11 +55,17 @@
           <button id="undo" class="btn small ghost">Undo last</button>
           <button id="clear-points" class="btn small ghost">Clear points</button>
         </div>
+        <p class="hint">Labelling an older year? Step 7 can show Landsat pictures of
+          this place back to 1984.</p>
       </section>
 
       <!-- 4. Train the model -->
-      <section class="card">
+      <section class="card step-card" data-step="4">
         <h2><span class="step">4</span> Train the model</h2>
+        <label class="field"><span>Features</span>
+          <select id="feature-source"></select>
+        </label>
+        <p class="hint" id="feature-note"></p>
         <label class="field"><span>Method</span>
           <select id="classifier">
             <option value="rf">Random forest</option>
@@ -72,10 +78,14 @@
         <p class="hint" id="train-year-hint"></p>
         <button id="train" class="btn primary">Train model</button>
         <p class="hint" id="train-accuracy" hidden></p>
+        <button id="evaluate" class="btn small ghost evaluate-btn" type="button"
+          title="Score your points with every feature type, on the same points and folds">
+          Compare feature types</button>
+        <div id="feature-compare" class="feature-compare" hidden></div>
       </section>
 
       <!-- 5. Classify -->
-      <section class="card">
+      <section class="card step-card" data-step="5">
         <h2><span class="step">5</span> Classify</h2>
         <div class="year-block">
           <div class="year-head">
@@ -87,13 +97,13 @@
         <button id="classify" class="btn primary">Classify</button>
         <label class="field opacity">
           <span>Overlay opacity</span>
-          <input id="opacity" type="range" min="0" max="100" step="5" value="70" />
+          <input id="opacity" class="opacity-input" type="range" min="0" max="100" step="5" value="70" />
         </label>
         <p class="hint" id="classify-hint">Train a model (step 4) first.</p>
       </section>
 
       <!-- 6. Compare two years -->
-      <section class="card">
+      <section class="card step-card" data-step="6">
         <h2><span class="step">6</span> Compare two years</h2>
         <p class="hint">Apply your trained model to two years and colour every place the
           class changed.</p>
@@ -106,6 +116,32 @@
         <button id="compare" class="btn primary">Compare</button>
         <p class="hint" id="compare-note" hidden></p>
         <ul id="transitions" class="legend"></ul>
+      </section>
+
+      <!-- 7. Satellite imagery -->
+      <section class="card step-card" data-step="7">
+        <h2><span class="step">7</span> Look at the satellite pictures</h2>
+        <p class="hint">See what the satellite actually saw. Flip between your two
+          comparison years to check whether the changes the model found are real.</p>
+        <label class="field"><span>Imagery</span>
+          <select id="imagery-style">
+            <option value="">Esri basemap (recent, mixed dates)</option>
+          </select>
+        </label>
+        <div class="year-stepper" id="imagery-year-row" hidden>
+          <button id="imagery-prev" class="btn small ghost" type="button" title="previous year">&#9664;</button>
+          <select id="imagery-year" aria-label="Landsat imagery year"></select>
+          <button id="imagery-next" class="btn small ghost" type="button" title="next year">&#9654;</button>
+        </div>
+        <div class="row jump-row" id="imagery-jumps" hidden>
+          <button class="btn small ghost" type="button" data-jump="a"></button>
+          <button class="btn small ghost" type="button" data-jump="b"></button>
+        </div>
+        <p class="hint" id="imagery-note"></p>
+        <label class="field opacity">
+          <span>Classification overlay opacity</span>
+          <input id="opacity-7" class="opacity-input" type="range" min="0" max="100" step="5" value="70" />
+        </label>
       </section>
 
       <!-- Results -->
@@ -125,6 +161,7 @@
 
       <footer class="panel-foot">
         <p>Embeddings: AlphaEarth Foundations (Google/DeepMind), CC-BY 4.0, via Source Cooperative.</p>
+        <p>Landsat: USGS Landsat Collection 2 Level-2, via Microsoft Planetary Computer.</p>
       </footer>
     </aside>
 

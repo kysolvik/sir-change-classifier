@@ -1,6 +1,7 @@
 """API tests. The embedding source is stubbed (no network): the cache's reader
 returns the synthetic separable window, so the real classify/colorize pipeline
 and endpoint validation are exercised end to end."""
+import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
@@ -10,6 +11,19 @@ from tests.conftest import make_point, make_window
 from tests.test_cache import InMemoryBackend
 
 WINDOW = make_window()
+
+
+def _float_window():
+    """A raw-Landsat-style float composite: 6 bands, left=A/right=B, NaN corner.
+    Same geotransform as WINDOW so _payload's points land on the right halves."""
+    arr = np.full((40, 40, 6), 0.1, dtype=np.float32)
+    arr[:, :20, :3] = 0.8
+    arr[:, 20:, 3:] = 0.8
+    arr[0:2, 0:2, :] = np.nan
+    return EmbeddingWindow(arr, WINDOW.x0, WINDOW.y0, WINDOW.pix, WINDOW.epsg)
+
+
+FLOAT_WINDOW = _float_window()
 
 
 def _swapped(win):
@@ -33,7 +47,7 @@ def client(monkeypatch):
     monkeypatch.setattr(main.embeddings, "get_index", fake_get_index)
     monkeypatch.setattr(main.cache, "_reader", fake_reader)
     monkeypatch.setattr(main.cache, "backend", InMemoryBackend())
-    main.cache._inproc.clear()
+    main.cache.clear_hot()
     main.limiter.reset()
     main.classify_cap._stamps.clear()
     with TestClient(main.app) as c:
@@ -105,7 +119,7 @@ def compare_client(monkeypatch):
     monkeypatch.setattr(main.embeddings, "get_index", fake_get_index)
     monkeypatch.setattr(main.cache, "_reader", fake_reader)
     monkeypatch.setattr(main.cache, "backend", InMemoryBackend())
-    main.cache._inproc.clear()
+    main.cache.clear_hot()
     main.limiter.reset()
     main.classify_cap._stamps.clear()
     with TestClient(main.app) as c:
@@ -187,3 +201,129 @@ def test_static_files_gzipped_and_cacheable(client):
     assert r.status_code == 200
     assert r.headers["content-encoding"] == "gzip"
     assert "max-age" in r.headers["cache-control"]
+
+
+@pytest.fixture
+def landsat_client(monkeypatch):
+    async def fake_aef(box, year):
+        return WINDOW
+
+    async def fake_landsat(box, year):
+        return FLOAT_WINDOW
+
+    async def fake_get_index():
+        return None
+
+    monkeypatch.setattr(main.embeddings, "get_index", fake_get_index)
+    monkeypatch.setattr(main.cache, "_reader", fake_aef)
+    monkeypatch.setattr(main.cache, "_landsat_reader", fake_landsat)
+    monkeypatch.setattr(main.cache, "backend", InMemoryBackend())
+    main.cache.clear_hot()
+    with TestClient(main.app) as c:
+        yield c
+
+
+def test_classify_landsat_happy_path(landsat_client):
+    # _payload's 37.78,-122.44 is the SF preset, so raw Landsat is allowed.
+    r = landsat_client.post("/api/classify", json=_payload(feature_source="landsat"))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert set(body["class_pixel_counts"]) == {"A", "B"}
+    assert body["n_points_used"] == 6
+
+
+def test_classify_landsat_rejected_off_preset(landsat_client):
+    r = landsat_client.post(
+        "/api/classify", json=_payload(feature_source="landsat", lat=0.0, lon=0.0)
+    )
+    assert r.status_code == 400
+    assert "example places" in r.json()["detail"]
+
+
+# --- multi-year Landsat, feature comparison, imagery ------------------------
+def test_config_lists_feature_sources(client):
+    body = client.get("/api/config").json()
+    by_id = {f["id"]: f for f in body["feature_sources"]}
+    assert by_id["aef"]["min_year"] == 2017
+    assert by_id["landsat"]["min_year"] == 1984
+    assert by_id["landsat"]["imagery"] and not by_id["aef"]["imagery"]
+    assert {s["id"] for s in body["imagery_styles"]} >= {"natural", "false"}
+
+
+def test_landsat_accepts_pre_aef_years(landsat_client):
+    r = landsat_client.post(
+        "/api/compare",
+        json=_compare_payload(feature_source="landsat", training_year=1990,
+                              year_a=1985, year_b=2025),
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["year_a"] == 1985
+
+
+def test_aef_rejects_pre_2017_years(landsat_client):
+    r = landsat_client.post("/api/classify", json=_payload(training_year=1990))
+    assert r.status_code == 422
+
+
+def _eval_payload(**overrides):
+    payload = _payload()
+    payload.pop("target_year")
+    payload.update(overrides)
+    return payload
+
+
+def test_evaluate_scores_every_source_on_shared_points(landsat_client):
+    r = landsat_client.post("/api/evaluate", json=_eval_payload())
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [x["source"] for x in body["results"]] == ["aef", "landsat"]
+    assert body["n_points_shared"] == 6 and body["skipped"] == []
+    for res in body["results"]:
+        assert res["accuracy"] == 1.0  # the synthetic halves are separable
+        assert set(res["per_class"]) == {"A", "B"}
+
+
+def test_evaluate_skips_sources_not_covering_year(landsat_client):
+    r = landsat_client.post("/api/evaluate", json=_eval_payload(training_year=1995))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [x["source"] for x in body["results"]] == ["landsat"]
+    assert body["skipped"][0]["source"] == "aef"
+
+
+def test_evaluate_skips_preset_only_source_off_preset(landsat_client):
+    r = landsat_client.post("/api/evaluate", json=_eval_payload(lat=0.0, lon=0.0))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [x["source"] for x in body["results"]] == ["aef"]
+    assert body["skipped"][0]["source"] == "landsat"
+    assert "example places" in body["skipped"][0]["reason"]
+    # Pre-2017 off-preset: no source is left at all.
+    r = landsat_client.post(
+        "/api/evaluate", json=_eval_payload(lat=0.0, lon=0.0, training_year=1995)
+    )
+    assert r.status_code == 400
+    assert "No feature source" in r.json()["detail"]
+
+
+def test_imagery_renders_landsat(landsat_client):
+    r = landsat_client.get("/api/imagery", params={"lat": 37.78, "lon": -122.44, "year": 1990})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["image"].startswith("data:image/png;base64,")
+    assert body["year"] == 1990 and body["style"] == "natural"
+    assert 0.99 < body["coverage"] < 1.0  # the NaN corner
+
+
+@pytest.mark.parametrize(
+    "params, code",
+    [
+        ({"year": 1990, "style": "nope"}, 400),
+        ({"year": 1970}, 422),
+        ({"year": 2020, "source": "aef"}, 400),  # embeddings aren't a picture
+        ({"year": 2020, "lat": 0.0, "lon": 0.0}, 400),  # off-preset
+    ],
+)
+def test_imagery_rejects_bad_requests(landsat_client, params, code):
+    q = {"lat": 37.78, "lon": -122.44, **params}
+    assert landsat_client.get("/api/imagery", params=q).status_code == code

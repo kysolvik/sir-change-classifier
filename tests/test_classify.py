@@ -3,6 +3,7 @@ import pytest
 
 from app import classify
 from app.config import NODATA
+from app.embeddings import EmbeddingWindow
 
 
 def test_dequantize_unit_range():
@@ -89,6 +90,29 @@ def test_train_model_and_predict_window_match_wrapper(window, points):
     assert np.array_equal(labels, res.labels)
 
 
+def test_train_and_predict_on_float_bands():
+    """Raw-imagery path: float32 (H,W,n_bands) with NaN as the mask sentinel."""
+    from app.embeddings import EmbeddingWindow
+    from tests.conftest import make_point
+
+    arr = np.full((40, 40, 6), 0.1, dtype=np.float32)
+    arr[:, :20, :3] = 0.8   # class A: first 3 bands high
+    arr[:, 20:, 3:] = 0.8   # class B: last 3 bands high
+    arr[0:2, 0:2, :] = np.nan  # masked corner
+    win = EmbeddingWindow(arr, x0=500005.0, y0=4185005.0, pix=30.0, epsg=32610)
+
+    pts = [make_point(win, r, c, "A") for r, c in [(10, 5), (20, 3), (30, 6)]]
+    pts += [make_point(win, r, c, "B") for r, c in [(10, 30), (20, 28), (30, 31)]]
+    res = classify.train_and_predict(win, win, pts, ["A", "B"], "rf")
+
+    assert res.labels.shape == (40, 40)
+    assert res.labels[20, 5] == 0            # left half -> A
+    assert res.labels[20, 30] == 1           # right half -> B
+    assert res.labels[0, 0] == -1            # NaN corner masked
+    assert set(np.unique(res.labels)).issubset({-1, 0, 1})
+    assert res.n_points_used == 6
+
+
 def test_transition_map_ids_and_observed():
     k = 3
     a = np.array([[0, 1, 2], [0, -1, 2]], dtype=np.int16)
@@ -105,3 +129,30 @@ def test_transition_map_ids_and_observed():
     assert {(f, t) for f, t, _ in observed} == {(1, 2), (2, 0), (0, 1)}
     assert all(px == 1 for _, _, px in observed)
     assert n_comparable == 5        # 6 pixels, 1 nodata in A (changed + unchanged)
+
+
+def test_cross_validate_overall_and_per_class(window, points):
+    X, y, _ = classify.sample_points(window, points, {"A": 0, "B": 1})
+    ev = classify.cross_validate("rf", X, y)
+    assert ev.accuracy == 1.0 and ev.per_class == {0: 1.0, 1: 1.0}
+    # One point in a class can't be held out and still trained on.
+    ev = classify.cross_validate("rf", X[:6], y[:6])
+    assert ev.accuracy is None
+
+
+def test_compare_sources_uses_only_points_valid_everywhere(window, points):
+    # A float "Landsat" window with the same layout, but NaN where point 0 sits.
+    arr = np.full((40, 40, 6), 0.1, dtype=np.float32)
+    arr[:, :20, :3] = 0.8
+    arr[:, 20:, 3:] = 0.8
+    arr[10, 5, :] = np.nan  # points[0] is at (10, 5)
+    lsat = EmbeddingWindow(arr, window.x0, window.y0, window.pix, window.epsg)
+
+    results, n_shared = classify.compare_sources(
+        {"aef": window, "landsat": lsat}, points, ["A", "B"], "knn"
+    )
+    assert n_shared == len(points) - 1
+    assert results["aef"].n_points_usable == len(points)
+    assert results["landsat"].n_points_usable == len(points) - 1
+    assert all(r.evaluation.n_points == n_shared for r in results.values())
+    assert all(r.evaluation.accuracy == 1.0 for r in results.values())

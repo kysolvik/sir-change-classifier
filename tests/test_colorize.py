@@ -45,3 +45,16 @@ def test_ids_to_png_maps_ids_and_is_transparent_off_map():
     assert px[1, 0] == (0, 0, 255, 255)   # id 7
     assert px[0, 1][3] == 0               # -1 -> transparent
     assert px[1, 1][3] == 0               # unmapped id 9 -> transparent
+
+
+def test_bands_to_png_masks_nan_and_uses_fixed_stretch():
+    from app import config
+
+    arr = np.full((4, 4, 6), 0.15, dtype=np.float32)
+    arr[0, 0, :] = np.nan
+    arr[1, 1, :] = 0.9  # brighter than the stretch max -> saturates to white
+    png = colorize.bands_to_png(arr, config.LANDSAT_BANDS, "natural")
+    img = np.asarray(Image.open(io.BytesIO(png)))
+    assert img[0, 0, 3] == 0 and img[2, 2, 3] == 255
+    assert tuple(img[1, 1, :3]) == (255, 255, 255)
+    assert 100 < img[2, 2, 0] < 255  # mid reflectance -> mid grey
